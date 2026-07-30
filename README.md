@@ -108,7 +108,7 @@ install.packages(c(
 
 ### Analysis Approach
 
-All data preprocessing, statistical analysis, and visualization were performed using **RStudio (version 2026.07.1+147)** and **R (version 4.x)**.
+All data preprocessing, statistical analysis, and visualization were performed using **RStudio (version 2026.07.1+147)** and **R (version 4.3.3)**.
 
 LC-MS abundances (99 compounds, 211 samples: 76 Control, 135 Cancer Stages 1–4) were log2-transformed, then each compound was tested for association with Stage via ANOVA (BH-corrected) with Tukey post-hoc and Welch cross-checks. Multivariate methods (clustering, PCA, sample correlation) and KEGG pathway enrichment followed.
 
@@ -137,7 +137,7 @@ The dataset is **publicly available** through the Metabolomics Workbench databas
 
 **Software**
 - RStudio (version 2026.07.1+147)
-- R (version 4.x)
+- R (version 4.3.3)
 
 **R Packages**
 - `tidyverse`
