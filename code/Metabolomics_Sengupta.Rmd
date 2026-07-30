@@ -1,6 +1,9 @@
 ---
 title: "BreastCancer_Metabolomics"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
 date: "2026-07-28"
 ---
 
@@ -121,7 +124,7 @@ metadata_df <- tibble(
 ```
 
 
-Now let's join it with your metadata.
+Now let's join it with the metadata.
 wrie this code
 
 ```{r}
@@ -130,7 +133,7 @@ analysis_df <- metadata_df |>
   left_join(metab_t, by = "Sample")
 dim(analysis_df)
 ```
-Your reconstructed dataset is correct:
+My reconstructed dataset is correct:
 
 ✅ 211 samples
 ✅ 99 metabolites
@@ -261,11 +264,11 @@ What does this mean biologically?
 
 LC-MS metabolomics data almost always look like this before preprocessing.
 
-A few metabolites are present at relatively high abundance, while many are present at much lower abundance. This produces the characteristic right-skewed distribution you're seeing.
+A few metabolites are present at relatively high abundance, while many are present at much lower abundance. This produces the characteristic right-skewed distribution I am seeing.
 
 Because of that, it's standard practice to apply a log transformation before PCA. The log compresses the high values more than the low values, making the distribution more symmetric and reducing the influence of extreme values.
 
-We'll impute the missing values using a tidyverse-friendly approach and discuss why we choose that particular imputation method, rather than just applying it. That way you'll understand both the code and the reasoning behind it.
+We'll impute the missing values using a tidyverse-friendly approach and discuss why we choose that particular imputation method, rather than just applying it. That way I'll understand both the code and the reasoning behind it.
 Before we log-transform...
 
 We need to address one issue first.
@@ -408,7 +411,7 @@ The mean is essentially 0 (2.04 × 10⁻¹⁶ is just floating-point rounding er
 This confirms that the autoscaling was applied correctly.
 
 
-At this point, analysis_scaled is the dataset you should use for PCA.
+At this point, analysis_scaled is the dataset I should use for PCA.
 
 Next step: Principal Component Analysis (PCA)
 
@@ -502,7 +505,7 @@ This suggests that the largest sources of variation in the metabolite profiles a
 
 There are a few samples toward the edges of the plot (for example, around PC1 ≈ -10 or PC2 ≈ -10), but none appear to be extremely isolated from the rest of the data.
 I wouldn't consider them strong outliers based on this PCA alone.
-Interpretation you could use in a report
+Interpretation I could use in a report
 
 PCA was performed on the log₂-transformed and autoscaled metabolomics data. The first two principal components explained 12.3% and 9.2% of the total variance, respectively. The PCA score plot showed considerable overlap between breast cancer and control samples, indicating that the overall metabolomic profiles were not clearly separated by diagnosis based on the first two principal components. No extreme outliers were observed.
 
@@ -593,7 +596,7 @@ Remember that because we autoscaled the data:
 
 A positive mean indicates the group has above-average abundance for that metabolite.
 A negative mean indicates below-average abundance.
-The Log2FC column (difference between the group means) tells you both the direction and magnitude of the difference.
+The Log2FC column (difference between the group means) tells me both the direction and magnitude of the difference.
 Before we make a volcano plot
 
 Let's check how many metabolites are statistically significant after correcting for multiple testing (FDR).
@@ -643,7 +646,7 @@ ggplot(ttest_results,
   ) +
   theme_minimal()
 ```
-This looks excellent—it has the classic volcano plot shape and suggests your analysis pipeline has worked correctly.
+This looks excellent—it has the classic volcano plot shape and suggests our analysis pipeline has worked correctly.
 
 How to interpret it
 X-axis (Log2 Fold Change): Indicates the magnitude and direction of the difference between breast cancer and control.
@@ -655,17 +658,17 @@ Blue dashed horizontal line: Represents the significance threshold of p = 0.05.
 Blue dashed vertical lines: Represent log2 fold change = ±1, a commonly used threshold for large effect sizes.
 Red points: Metabolites with FDR < 0.05.
 Gray points: Metabolites that are not significant after multiple-testing correction.
-What your plot shows
+What the plot shows
 Most metabolites cluster near the center, indicating small fold changes and non-significant differences.
 There are a handful of metabolites with both large fold changes and very small p-values.
-You have two particularly strong metabolites (one on the left and one on the right) with very high statistical significance. These are likely the two metabolites that remained significant after FDR correction.
+I have two particularly strong metabolites (one on the left and one on the right) with very high statistical significance. These are likely the two metabolites that remained significant after FDR correction.
 Suggested report interpretation
 
 A volcano plot was used to visualize differential metabolite abundance between breast cancer and control samples. Most metabolites exhibited modest fold changes and were not statistically significant after multiple-testing correction. However, two metabolites remained significant after Benjamini–Hochberg FDR correction, indicating robust differences between the two groups. These metabolites represent the strongest candidates for potential biomarkers in this dataset.
 
 Optional improvement: Label the significant metabolites
 
-A volcano plot is much easier to interpret if the significant metabolites are labeled. If you're using ggrepel, you can add labels like this:
+A volcano plot is much easier to interpret if the significant metabolites are labeled. If we're using ggrepel, we can add labels like this:
 ```{r}
 library(ggrepel)
 
