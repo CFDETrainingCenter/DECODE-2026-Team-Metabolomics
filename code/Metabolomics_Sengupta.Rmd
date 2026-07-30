@@ -1,0 +1,707 @@
+---
+title: "BreastCancer_Metabolomics"
+output: html_document
+date: "2026-07-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+## Including Plots
+
+You can also embed plots, for example:
+
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+making object metab
+```{r}
+metab <- read.delim(
+  "data/MSdata_ST000355_AN000581.txt",
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+library(tidyverse)
+
+raw_data <- read.delim(
+  "data/MSdata_ST000355_AN000581.txt",
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+```
+
+Then recreate metadata and metab exactly like this:
+```{r}
+metadata <- raw_data |> 
+  slice(1)
+
+metab <- raw_data |> 
+  slice(-1)
+```
+Now check
+```{r}
+head(metab$Samples)
+```
+Do not run mutate(across(everything(), as.numeric)) this time.
+
+Instead, convert all columns except Samples:
+```{r}
+metab <- metab |>
+  mutate(
+    across(-Samples, as.numeric)
+  )
+head(metab$Samples)
+```
+Next step: Transpose the metabolite matrix
+
+We'll make the metabolite names become the column names and the samples become the rows.
+```{r}
+library(tibble)
+
+metab_t <- metab |>
+  column_to_rownames("Samples") |>
+  t() |>
+  as.data.frame() |>
+  rownames_to_column("Sample") |>
+  as_tibble()
+```
+#glimpse(metab_t)
+```{r}
+glimpse(metab_t)
+```
+check all that is missing
+this coe or #
+or 
+sum(is.na(metab_t$V100))
+```{r}
+summary(metab_t$V100)
+
+```
+
+Simply remove the V100
+```{r}
+metab_t <- metab_t |>
+  select(-V100)
+```
+Then verify the size
+```{r}
+dim(metab_t)
+tail(names(metab_t))
+```
+write this code
+
+```{r}
+metadata_df <- tibble(
+  Sample = names(raw_data)[-1],
+  Info = as.character(unlist(raw_data[1, -1]))
+) |>
+  tidyr::separate(
+    Info,
+    into = c("Diagnosis", "Stage"),
+    sep = " \\| "
+  ) |>
+  mutate(
+    Diagnosis = sub("Diagnosis:", "", Diagnosis),
+    Stage = sub("Stage:", "", Stage)
+  )
+```
+
+
+Now let's join it with your metadata.
+wrie this code
+
+```{r}
+
+analysis_df <- metadata_df |>
+  left_join(metab_t, by = "Sample")
+dim(analysis_df)
+```
+Your reconstructed dataset is correct:
+
+✅ 211 samples
+✅ 99 metabolites
+✅ 3 metadata variables (Sample, Diagnosis, Stage)
+✅ Total: 211 × 102
+Next: Assess missing values
+
+Let's see how much missing data each metabolite has.
+```{r}
+missing_summary <- analysis_df |>
+  summarise(
+    across(
+      -c(Sample, Diagnosis, Stage),
+      ~ sum(is.na(.))
+    )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Metabolite",
+    values_to = "Missing"
+  ) |>
+  arrange(desc(Missing))
+
+missing_summary
+```
+Then check it how many metabolities have at least one missing value
+```{r}
+missing_summary |>
+  filter(Missing > 0)
+```
+Total numbers of missing values in the dataset
+```{r}
+sum(is.na(analysis_df))
+```
+
+
+Metabolite	Missing values
+5-Phosphoribosylamine	35
+Pentosidine	31
+Butyrylcarnitine	18
+6-Dehydrotestosterone glucuronide	15
+Homoanserine	15
+Epinephrine glucuronide	13
+Others	1–6
+
+Only 13 of the 99 metabolites have any missing values at all. Most metabolites are completely observed, and even the metabolite with the most missing values has 35 out of 211 samples missing (about 17%), which is generally acceptable for simple imputation in an exploratory metabolomics analysis.
+
+Next: Half-minimum imputation
+
+Run this code:
+```{r}
+analysis_imputed <- analysis_df |>
+  mutate(
+    across(
+      -c(Sample, Diagnosis, Stage),
+      ~ {
+        x <- .
+        half_min <- min(x[x > 0], na.rm = TRUE) / 2
+        replace(x, is.na(x), half_min)
+      }
+    )
+  )
+```
+Then verify that all missing values are gone:
+
+```{r}
+sum(is.na(analysis_imputed))
+```
+
+Plot the abundance distribution
+
+First, convert the metabolite data into a long format:
+```{r}
+library(tidyverse)
+
+abundance_long <- analysis_imputed |>
+  pivot_longer(
+    cols = -c(Sample, Diagnosis, Stage),
+    names_to = "Metabolite",
+    values_to = "Abundance"
+  )
+```
+Then plot the distribution of all metabolite abundances:
+```{r}
+ggplot(abundance_long, aes(x = Abundance)) +
+  geom_histogram(bins = 50,
+                 fill = "steelblue",
+                 color = "black") +
+  labs(
+    title = "Distribution of Metabolite Abundances",
+    x = "Abundance",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+  
+```
+
+Plot abundance distribution (raw data)
+Log₂ transformation
+Plot transformed abundance distribution
+Continue with downstream analyses (PCA, statistical testing, etc.)
+
+Transpose command is (t())
+
+Next: Log₂ transformation
+
+This is one of the most important preprocessing steps in metabolomics.
+
+Why do we log-transform?
+
+The larger metabolite dominates analyses like PCA, even though both changed by the same fold change.
+
+A log₂ transform makes equal fold changes more comparable.
+
+Why log2(x + 1)?
+The +1 prevents problems if a value is zero, because:log2(0) is undefined.
+
+```{r}
+analysis_log <- analysis_imputed |>
+  mutate(
+    across(
+      -c(Sample, Diagnosis, Stage),
+      ~ log2(. + 1)
+    )
+  )
+```
+What does this mean biologically?
+
+LC-MS metabolomics data almost always look like this before preprocessing.
+
+A few metabolites are present at relatively high abundance, while many are present at much lower abundance. This produces the characteristic right-skewed distribution you're seeing.
+
+Because of that, it's standard practice to apply a log transformation before PCA. The log compresses the high values more than the low values, making the distribution more symmetric and reducing the influence of extreme values.
+
+We'll impute the missing values using a tidyverse-friendly approach and discuss why we choose that particular imputation method, rather than just applying it. That way you'll understand both the code and the reasoning behind it.
+Before we log-transform...
+
+We need to address one issue first.
+
+Some metabolite values are missing (NA). We have two sensible options:
+
+Impute the missing values first, then apply the log transformation. This is the workflow used in many metabolomics pipelines.
+Remove metabolites with excessive missingness, then impute the remaining missing values.
+
+Since our highest missing rate is only 16.6%, we are keeping all 99 metabolites and imputing the missing values.
+We'll impute the missing values using a tidyverse-friendly approach and discuss why we choose that particular imputation method, rather than just applying it. That way we'll understand both the code and the reasoning behind it.
+#across(where(is.numeric), ...) means Apply the same operation to every numeric column (all 99 metabolites).
+half_min <- min(., na.rm = TRUE) / 2  
+For each metabolite, find its smallest observed value and divide it by two.
+if_else(is.na(.), half_min, .)
+This says:
+
+If the value is missing (NA), replace it with half_min.
+Otherwise, keep the original value.
+
+Now verify that the transformation worked by looking at a few values:
+```{r}
+analysis_log |>
+  select(Sample, Arginine) |>
+  head()
+```
+or compare the original and transformed values:
+
+```{r}
+
+analysis_imputed |>
+  select(Sample, Arginine) |>
+  head()
+
+analysis_log |>
+  select(Sample, Arginine) |>
+  head()
+```
+
+Next step (as in our original workflow)
+
+Now plot the distribution after the log₂ transformation.
+
+
+```{r}
+abundance_log <- analysis_log |>
+  pivot_longer(
+    cols = -c(Sample, Diagnosis, Stage),
+    names_to = "Metabolite",
+    values_to = "Abundance"
+  )
+```
+Now let us ccreate the histogram
+```{r}
+ggplot(abundance_log, aes(x = Abundance)) +
+  geom_histogram(
+    bins = 50,
+    fill = "steelblue",
+    color = "black"
+  ) +
+  labs(
+    title = "Distribution of Log2-Transformed Metabolite Abundances",
+    x = "log2(Abundance + 1)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+The metabolite abundance data were log₂(x + 1)-transformed following half-minimum imputation. The transformation reduced the effect of highly abundant metabolites and compressed the dynamic range of the data. Although the distribution remained moderately right-skewed, it was less influenced by extreme values and was more suitable for subsequent statistical analyses.
+
+This histogram matches what I would expect from this dataset.
+
+One more preprocessing step remains: scaling
+
+This is arguably the most important step before PCA.
+
+Imagine two metabolites:
+
+Metabolite	Typical range
+A	0.01–0.05
+B	0.5–2.0
+
+Even after log transformation, metabolite B has much larger variability than metabolite A. If we run PCA now, metabolites with larger variance will dominate the principal components.
+
+Scaling adjusts for this.
+
+The three common choices are:
+Method	Used in metabolomics?	Effect
+None	Rare	Large-variance metabolites dominate
+Autoscaling (z-score)	Very common	Every metabolite gets equal variance
+Pareto scaling	Very common	Reduces dominance while preserving some biological differences
+xactly. This is the last preprocessing step before PCA.
+
+Why scaling is needed
+
+After log₂ transformation, metabolites are still measured on different scales. For example:
+
+Metabolite	Typical range
+A	0.01–0.05
+B	0.5–2.0
+
+Without scaling, metabolite B has much larger variance, so it contributes much more to the principal components than metabolite A. PCA is variance-based, so this can bias the results.
+
+Scaling puts metabolites on a more comparable scale.
+
+Common scaling methods
+Method	Used in metabolomics?	Effect
+None	Rare	Large-variance metabolites dominate
+Autoscaling (z-score)	Very common	Each metabolite has mean = 0 and SD = 1
+Pareto scaling	Very common	Reduces dominance but preserves some variance differences
+
+For this workflow, we'll use autoscaling (z-score scaling), which is the most common choice before PCA.
+Apply Autoscaling in R
+```{r}
+analysis_scaled <- analysis_log |>
+  mutate(
+    across(
+      -c(Sample, Diagnosis, Stage),
+      ~ as.numeric(scale(.))
+    )
+  )
+```
+
+The scale() function:
+
+subtracts the mean from each metabolite,
+divides by its standard deviation,
+results in each metabolite having:
+mean ≈ 0
+standard deviation ≈ 1
+Verify the scaling
+
+For example, check Arginine:
+```{r}
+mean(analysis_scaled$Arginine)
+sd(analysis_scaled$Arginine)
+```
+The mean is essentially 0 (2.04 × 10⁻¹⁶ is just floating-point rounding error), and the standard deviation is exactly 1.
+
+This confirms that the autoscaling was applied correctly.
+
+
+At this point, analysis_scaled is the dataset you should use for PCA.
+
+Next step: Principal Component Analysis (PCA)
+
+We'll extract the metabolite matrix (excluding the metadata) and run PCA.
+```{r}
+pca_data <- analysis_scaled |>
+  select(-Sample, -Diagnosis, -Stage)
+```
+Then perform PCA:
+
+```{r}
+pca_result <- prcomp(
+  pca_data,
+  center = FALSE,
+  scale. = FALSE
+)
+```
+Notice that we set center = FALSE and scale. = FALSE because we have already centered and scaled the data using scale(). Applying centering and scaling again would be redundant.
+
+After that, we'll create a PCA scores plot by diagnosis to see whether the breast cancer and control samples separate along the principal components.
+
+Great! Let's perform the PCA and then visualize the results.
+
+Step 1: Extract the metabolite matrix
+```{r}
+pca_data <- analysis_scaled |>
+  select(-Sample, -Diagnosis, -Stage)
+```
+RUN PCA
+```{r}
+pca_result <- prcomp(
+  pca_data,
+  center = FALSE,
+  scale. = FALSE
+)
+```
+Create a data frame of the PCA scores
+```{r}
+pca_scores <- as.data.frame(pca_result$x) |>
+  bind_cols(
+    analysis_scaled |>
+      select(Sample, Diagnosis, Stage)
+  )
+```
+Calculate the variance explained
+```{r}
+variance <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+variance
+```
+The first two values of variance correspond to the proportion of variation explained by PC1 and PC2.
+
+Step 5: Plot the PCA
+```{r}
+library(ggplot2)
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = Diagnosis)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "PCA Score Plot",
+    x = paste0("PC1 (", round(variance[1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(variance[2] * 100, 1), "%)")
+  ) +
+  theme_minimal()
+```
+This PCA score plot will show whether the breast cancer and control samples cluster separately based on their metabolomic profiles.
+
+whether the groups separate,
+whether there are any outliers,
+and what the percentage of variance explained by PC1 and PC2 tells us.
+This looks good, and it's actually a fairly typical PCA result for a biological dataset.
+
+Interpretation
+
+1. PC1 explains 12.3% of the variance
+
+PC1 captures the largest source of variation in the metabolomics data.
+However, it only explains 12.3%, which means the variation is spread across many metabolites rather than being driven by a few.
+
+2. PC2 explains 9.2% of the variance
+
+PC2 captures the second-largest independent source of variation.
+Together, PC1 and PC2 explain about 21.5% of the total variance.
+
+3. Group separation
+
+The breast cancer (pink) and control (blue) samples show substantial overlap.
+There is no clear separation between the two groups on the first two principal components.
+This suggests that the largest sources of variation in the metabolite profiles are not solely due to diagnosis.
+
+4. Outliers
+
+There are a few samples toward the edges of the plot (for example, around PC1 ≈ -10 or PC2 ≈ -10), but none appear to be extremely isolated from the rest of the data.
+I wouldn't consider them strong outliers based on this PCA alone.
+Interpretation you could use in a report
+
+PCA was performed on the log₂-transformed and autoscaled metabolomics data. The first two principal components explained 12.3% and 9.2% of the total variance, respectively. The PCA score plot showed considerable overlap between breast cancer and control samples, indicating that the overall metabolomic profiles were not clearly separated by diagnosis based on the first two principal components. No extreme outliers were observed.
+
+Next step
+
+The next thing we did in the workflow was to determine which metabolites differ significantly between breast cancer and controls using univariate statistical analysis (typically a t-test or Wilcoxon test, depending on assumptions), followed by visualization with a volcano plot.
+
+That complements the PCA nicely:
+
+PCA asks: Do the overall metabolomic profiles separate?
+Differential analysis asks: Which individual metabolites differ between the groups?
+
+Perfect—we'll continue with Step 3: Differential metabolite analysis.
+
+The goal is to identify which metabolites differ significantly between the breast cancer and control groups.
+
+Step 1: Perform a t-test for every metabolite
+
+Run the following code:
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+
+metabolite_names <- analysis_scaled |>
+  select(-Sample, -Diagnosis, -Stage) |>
+  names()
+
+ttest_results <- map_dfr(metabolite_names, function(met) {
+
+  test <- t.test(
+    analysis_scaled[[met]] ~ analysis_scaled$Diagnosis
+  )
+
+  tibble(
+    Metabolite = met,
+    Mean_BreastCancer = mean(
+      analysis_scaled[[met]][analysis_scaled$Diagnosis == "Breast cancer"]
+    ),
+    Mean_Control = mean(
+      analysis_scaled[[met]][analysis_scaled$Diagnosis == "Control"]
+    ),
+    Log2FC = Mean_BreastCancer - Mean_Control,
+    P_value = test$p.value
+  )
+})
+```
+Step 2: Correct for multiple testing
+
+Since we're testing 99 metabolites, we should control the false discovery rate (FDR).
+
+Run:
+```{r}
+ttest_results <- ttest_results |>
+  mutate(
+    FDR = p.adjust(P_value, method = "BH")
+  ) |>
+  arrange(P_value)
+```
+View the most significant metabolites
+```{r}
+head(ttest_results, 10)
+```
+This will show the 10 metabolites with the smallest p-values, along with their:
+
+Mean abundance in breast cancer
+Mean abundance in controls
+Log2 fold change
+Raw p-value
+FDR-adjusted p-value
+
+
+Here's how to interpret the first few:
+
+Metabolite	Higher in
+Glycerophosphocholine	Control (mean = 0.88 vs -0.50)
+Glutamine	Breast cancer (0.42 vs -0.74)
+Lysine	Breast cancer
+Butyrylcarnitine	Breast cancer
+Pentosidine	Control
+Propionylcarnitine	Breast cancer
+Uracil	Breast cancer
+Phenyllactic acid	Control
+Nicotinuric acid	Control
+Bilirubin	Breast cancer
+
+Remember that because we autoscaled the data:
+
+A positive mean indicates the group has above-average abundance for that metabolite.
+A negative mean indicates below-average abundance.
+The Log2FC column (difference between the group means) tells you both the direction and magnitude of the difference.
+Before we make a volcano plot
+
+Let's check how many metabolites are statistically significant after correcting for multiple testing (FDR).
+
+Run:
+```{r}
+sum(ttest_results$FDR < 0.05)
+```
+```{r}
+ttest_results |>
+  filter(FDR < 0.05)
+```
+It looks like only two metabolites remained significant after Benjamini–Hochberg FDR correction (FDR < 0.05):
+
+3-Indolepropionic acid
+4-Hydroxy-2-oxoglutaric acid
+
+That's actually a common outcome in untargeted metabolomics. We may see many metabolites with small raw p-values, but after correcting for multiple testing, only a few remain statistically significant.
+
+Interpretation for our report
+
+Differential abundance analysis was performed using independent two-sample t-tests followed by Benjamini–Hochberg false discovery rate (FDR) correction. Although several metabolites showed significant raw p-values, only 3-Indolepropionic acid and 4-Hydroxy-2-oxoglutaric acid remained statistically significant after FDR correction (FDR < 0.05).
+
+
+
+Next: Create a volcano plot
+
+```{r}
+library(ggplot2)
+
+ggplot(ttest_results,
+       aes(x = Log2FC,
+           y = -log10(P_value))) +
+  geom_point(aes(color = FDR < 0.05), size = 2.5) +
+  scale_color_manual(values = c("grey70", "red")) +
+  geom_vline(xintercept = c(-1, 1),
+             linetype = "dashed",
+             color = "blue") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed",
+             color = "blue") +
+  labs(
+    title = "Volcano Plot",
+    x = "Log2 Fold Change",
+    y = "-log10(p-value)",
+    color = "FDR < 0.05"
+  ) +
+  theme_minimal()
+```
+This looks excellent—it has the classic volcano plot shape and suggests your analysis pipeline has worked correctly.
+
+How to interpret it
+X-axis (Log2 Fold Change): Indicates the magnitude and direction of the difference between breast cancer and control.
+Positive values → higher in breast cancer.
+Negative values → higher in controls.
+Y-axis (-log10(p-value)): Indicates statistical significance.
+Higher points correspond to smaller p-values and therefore stronger evidence of differential abundance.
+Blue dashed horizontal line: Represents the significance threshold of p = 0.05.
+Blue dashed vertical lines: Represent log2 fold change = ±1, a commonly used threshold for large effect sizes.
+Red points: Metabolites with FDR < 0.05.
+Gray points: Metabolites that are not significant after multiple-testing correction.
+What your plot shows
+Most metabolites cluster near the center, indicating small fold changes and non-significant differences.
+There are a handful of metabolites with both large fold changes and very small p-values.
+You have two particularly strong metabolites (one on the left and one on the right) with very high statistical significance. These are likely the two metabolites that remained significant after FDR correction.
+Suggested report interpretation
+
+A volcano plot was used to visualize differential metabolite abundance between breast cancer and control samples. Most metabolites exhibited modest fold changes and were not statistically significant after multiple-testing correction. However, two metabolites remained significant after Benjamini–Hochberg FDR correction, indicating robust differences between the two groups. These metabolites represent the strongest candidates for potential biomarkers in this dataset.
+
+Optional improvement: Label the significant metabolites
+
+A volcano plot is much easier to interpret if the significant metabolites are labeled. If you're using ggrepel, you can add labels like this:
+```{r}
+library(ggrepel)
+
+ggplot(ttest_results,
+       aes(x = Log2FC,
+           y = -log10(P_value))) +
+  geom_point(aes(color = FDR < 0.05), size = 2.5) +
+  geom_text_repel(
+    data = subset(ttest_results, FDR < 0.05),
+    aes(label = Metabolite),
+    size = 3
+  ) +
+  scale_color_manual(values = c("grey70", "red")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+  theme_minimal()
+```
+The published paper compared ER-positive and ER-negative breast cancers, whereas my analysis compared all breast cancer samples with healthy controls. Therefore, the biological comparison is different. Glutamine may be elevated overall in breast cancer relative to controls, while being depleted specifically in ER-negative tumors due to increased glutamine utilization. These findings are not necessarily contradictory."
+
+That is a scientifically sound explanation.
+
+Check
+```{r}
+table(analysis_scaled$Diagnosis)
+```
+The published paper compared ER-positive and ER-negative breast cancers, whereas my analysis compared all breast cancer samples with healthy controls. Therefore, the biological comparison is different. Glutamine may be elevated overall in breast cancer relative to controls, while being depleted specifically in ER-negative tumors due to increased glutamine utilization. These findings are not necessarily contradictory."
+
+That is a scientifically sound explanation.
+
+Run
+```{r}
+analysis_scaled %>%
+  group_by(Diagnosis) %>%
+  summarise(mean_glutamine = mean(Glutamine))
+```
+```{r}
+aggregate(Glutamine ~ Diagnosis, data = analysis_scaled, mean)
+```
+
