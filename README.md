@@ -12,7 +12,7 @@
 
 | Value | Description |
 |---|---|
-| **Reproducibility** | Every number and figure in this repo should be regeneratable from the raw ST000355 files and the scripts here. |
+| **Reproducibility** | Every analysis and figure should be regeneratable from the raw ST000355 files and the scripts here. |
 | **Transparency** | Imputation, transformation, and multiple-testing decisions are documented. |
 | **Statistical rigor** | Multiple testing correction (Benjamini–Hochberg), post-hoc pairwise testing (Tukey HSD), and covariate awareness (age) are implemented. |
 | **Open science** | Built entirely on a public, citable dataset. |
