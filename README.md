@@ -76,7 +76,7 @@ flowchart TD
 
 ```bash
 # R version
-R version 4.x
+R version 4.3.3
 
 # RStudio version
 RStudio 2026.07.1+147
