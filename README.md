@@ -177,3 +177,7 @@ The biological functions of significant metabolites were interpreted through a l
 - **Cross-sectional design:** Cannot support strict claims of metabolic "progression" over time — only stage-group differences at a single time point per patient.
 - **Weak stage-vs-stage differences:** Differences among cancer cases across stages are weak and inconsistent (0–5 of 42 compounds per pairwise contrast). The robust result in this dataset is **Cancer-vs-Control**, not stage-wise differences.
 
+## AI Usage 
+
+AI Assistance from Claude was used for data and pathway analysis. 
+
