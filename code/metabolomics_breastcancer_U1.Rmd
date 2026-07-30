@@ -1,0 +1,1726 @@
+---
+title: "BreastCancer_metabolomicsProfiling"
+author: "Ujjalkumar Das"
+date: "2026-07-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+## Preparing environment
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(gridExtra)
+```
+## Loading lcms data
+
+```{r}
+lcms_data <- read_tsv("MSdata_ST000355_AN000581.txt", col_names = TRUE, show_col_types = TRUE)
+
+lcms_data
+```
+
+## Separating sample metadata (Diagnosis, Stage) from the metabolite matrix
+
+The "Factors" row packs `Diagnosis` and `Stage` into a single string per sample
+(e.g. `Diagnosis:Breast cancer | Stage:1`). Pull it into its own metadata table, then drop it from `lcms_data` so the remaining rows are all metabolite abundances.
+
+```{r}
+sample_metadata <- lcms_data |>
+  filter(Samples == "Factors") |>
+  select(-Samples) |>
+  pivot_longer(everything(), names_to = "sample_id", values_to = "factor_string") |>
+  mutate(
+    Diagnosis = str_extract(factor_string, "(?<=Diagnosis:)[^|]+") |> str_trim(),
+    Stage     = str_extract(factor_string, "(?<=Stage:)[^|]+") |> str_trim()
+  ) |>
+  select(sample_id, Diagnosis, Stage)
+
+lcms_data_abundances <- lcms_data |>
+  filter(Samples != "Factors") |>
+  rename(Compound = Samples)
+
+sample_metadata
+sample_metadata |> 
+  count(Stage) |> print()
+lcms_data_abundances
+```
+
+## Cross-checking against metadata.csv
+
+`metadata.csv` provides Diagnosis/Stage independently (via `Sample name`).
+Join it to `sample_metadata` and check agreement.
+
+```{r}
+metadata_csv <- read_csv("metadata.csv", show_col_types = FALSE)
+metadata_csv
+
+metadata_merged <- sample_metadata |>
+  inner_join(metadata_csv, by = c("sample_id" = "Sample name")) |>
+  mutate(
+    diagnosis_match = Diagnosis.x == Diagnosis.y,
+    stage_match = as.character(Stage.x) == as.character(Stage.y)
+  )
+
+nrow(sample_metadata)
+nrow(metadata_csv)
+nrow(metadata_merged)
+
+metadata_merged |> count(diagnosis_match)
+metadata_merged |> count(stage_match)
+metadata_merged
+View(metadata_merged)
+```
+
+
+## polishing merged metadata
+
+```{r}
+metadata_merged <- 
+  metadata_merged |> 
+  rename(Stage = Stage.x, Diagnosis = Diagnosis.x) |> 
+  select(-ends_with(c(".y", "_match")), -`Subject name`, -`Sample_Data:Sub-group`)
+
+metadata_merged$Stage <- as.factor(metadata_merged$Stage)
+metadata_merged
+```
+
+
+
+
+## Long-format metabolite table for exploratory plots
+
+Pivot `lcms_data_abundances` into long format (one row per compound × sample)
+and join with `metadata_merged` so Diagnosis/Stage are available for plotting.
+
+```{r}
+lcms_long <- lcms_data_abundances |>
+  pivot_longer(-Compound, names_to = "sample_id", values_to = "abundance") |>
+  mutate(abundance = as.numeric(abundance)) |>
+  left_join(metadata_merged, by = "sample_id")
+lcms_long
+
+# 146 of ~20,900 compound x sample values are missing in the source data
+sum(is.na(lcms_long$abundance))
+lcms_long
+```
+
+## Heatmap of metabolite abundances by Stage
+
+Mean abundance per compound is computed for each Stage, then z-scored within each compound (row) so all 99 compounds — despite very different absolute scales — are visually comparable. Compounds are ordered by hierarchical clustering to group similar Stage-response patterns together.
+
+```{r, fig.height=14}
+heatmap_data <- lcms_long |>
+  group_by(Compound, Stage) |>
+  summarise(mean_abundance = mean(abundance, na.rm = TRUE), .groups = "drop") |>
+  group_by(Compound) |>
+  mutate(z = as.numeric(scale(mean_abundance))) |>
+  ungroup()
+
+clust_matrix <- heatmap_data |>
+  select(Compound, Stage, z) |>
+  pivot_wider(names_from = Stage, values_from = z) |>
+  column_to_rownames("Compound") |>
+  as.matrix()
+
+compound_order <- rownames(clust_matrix)[hclust(dist(clust_matrix))$order]
+
+heatmap_data <- heatmap_data |>
+  mutate(Compound = factor(Compound, levels = compound_order))
+
+ggplot(heatmap_data, aes(x = Stage, y = Compound, fill = z)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", midpoint = 0) +
+  labs(title = "Metabolite abundance by Stage (row z-scored)",
+       x = "Stage", y = NULL, fill = "z-score") +
+  theme(axis.text.y = element_text(size = 12)) 
+```
+
+## One-way ANOVA per compound across Diagnosis/Stage groups
+
+`Stage` has 5 levels: `-` (Control, n = 76) and cancer Stages 1-4
+(n = 19, 49, 47, 20). For each of the 99 compounds we fit a one-way ANOVA of
+log2-transformed abundance on `Stage`, then correct the 99 resulting p-values
+for multiple testing with the Benjamini-Hochberg (FDR) method.
+
+Abundances include exact zeros, so a small pseudocount (half the smallest
+observed non-zero abundance) is added before log-transforming.
+
+```{r}
+library(broom)
+
+min_pos <- min(lcms_long$abundance[lcms_long$abundance > 0], na.rm = TRUE)
+
+lcms_long_log <- lcms_long |>
+  mutate(log_abundance = log2(abundance + min_pos / 2))
+
+anova_results <- lcms_long_log |>
+  group_by(Compound) |>
+  nest() |>
+  mutate(
+    model = map(data, ~ aov(log_abundance ~ Stage, data = .x)),
+    tidy_model = map(model, broom::tidy)
+  ) |>
+  select(Compound, tidy_model) |>
+  unnest(tidy_model) |>
+  filter(term == "Stage") |>
+  ungroup() |>
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) |>
+  arrange(p_adj_BH)
+
+anova_results |> select(Compound, df, statistic, p.value, p_adj_BH)
+sum(anova_results$p_adj_BH < 0.05)
+```
+
+### Why log-transform? Skewness before and after
+
+Raw abundances are right-skewed for most compounds, which motivates the
+log2-transformation used above. We quantify skewness per compound on the
+raw scale and on the log2 scale to confirm the transform actually reduces
+it.
+
+```{r}
+skewness_fn <- function(x) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  (sum((x - mean(x))^3) / n) / sd(x)^3
+}
+
+skew_compare <- lcms_long_log |>
+  group_by(Compound) |>
+  summarise(
+    skewness_raw = skewness_fn(abundance),
+    skewness_log = skewness_fn(log_abundance),
+    .groups = "drop"
+  )
+
+summary(skew_compare$skewness_raw)
+summary(skew_compare$skewness_log)
+
+# How many compounds are "highly skewed" (|skewness| > 1) on each scale
+sum(abs(skew_compare$skewness_raw) > 1, na.rm = TRUE)
+sum(abs(skew_compare$skewness_log) > 1, na.rm = TRUE)
+```
+
+```{r, fig.width=9, fig.height=4}
+skew_compare_long <- skew_compare |>
+  pivot_longer(starts_with("skewness"), names_to = "scale", values_to = "skewness") |>
+  mutate(scale = recode(scale, skewness_raw = "Raw abundance", skewness_log = "Log2 abundance"),
+         scale = factor(scale, levels = c("Raw abundance", "Log2 abundance")))
+
+ggplot(skew_compare_long, aes(x = skewness)) +
+  geom_histogram(binwidth = 0.5, boundary = 0) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~scale, scales = "free_y") +
+  labs(title = "Per-compound skewness: raw vs. log2-transformed abundance",
+       x = "Skewness", y = "# compounds (of 99)")
+```
+
+Raw abundances are overwhelmingly right-skewed: median skewness is 1.78,
+and 74 of 99 compounds have |skewness| > 1, almost all in the positive
+(right-skewed) direction. On the log2 scale, median skewness moves close to
+zero (-0.06) and only 28 of 99 compounds remain highly skewed (a mix of
+residual right- and left-skew). Log2-transforming substantially reduces
+skewness overall -- supporting its use as the working scale for the ANOVA,
+Tukey, and correlation analyses above -- though it does not fully normalize
+every compound, consistent with the non-normal residuals noted in the
+assumption checks below.
+
+### Checking ANOVA assumptions
+
+```{r}
+library(car)
+
+anova_diag <- lcms_long_log |>
+  group_by(Compound) |>
+  nest() |>
+  mutate(
+    model = map(data, ~ aov(log_abundance ~ Stage, data = .x)),
+    shapiro_p = map_dbl(model, ~ shapiro.test(residuals(.x))$p.value),
+    levene_p = map_dbl(data, ~ tryCatch(
+      leveneTest(log_abundance ~ Stage, data = .x)[1, "Pr(>F)"],
+      error = function(e) NA_real_
+    ))
+  ) |>
+  select(Compound, shapiro_p, levene_p) |>
+  ungroup()
+
+# Residuals are non-normal for many compounds even after log transform;
+# a meaningful fraction also show unequal variance across groups.
+cat("Non-normal residuals (Shapiro p < .05):", sum(anova_diag$shapiro_p < 0.05), "/", nrow(anova_diag), "\n")
+cat("Unequal variances (Levene p < .05):    ", sum(anova_diag$levene_p < 0.05, na.rm = TRUE), "/", sum(!is.na(anova_diag$levene_p)), "\n")
+```
+
+Given the unequal variances flagged above (driven partly by the unbalanced group sizes), we cross-check with Welch's ANOVA, which does not assume equal variances.
+
+```{r}
+welch_results <- lcms_long_log |>
+  group_by(Compound) |>
+  nest() |>
+  mutate(
+    welch = map(data, ~ oneway.test(log_abundance ~ Stage, data = .x, var.equal = FALSE)),
+    statistic = map_dbl(welch, "statistic"),
+    p.value = map_dbl(welch, "p.value")
+  ) |>
+  select(Compound, statistic, p.value) |>
+  ungroup() |>
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) |>
+  arrange(p_adj_BH)
+
+# Agreement between standard-ANOVA and Welch-ANOVA significance calls
+# (rows = standard ANOVA sig., columns = Welch ANOVA sig.)
+compare_sig <- anova_results |>
+  select(Compound, p_adj_BH_std = p_adj_BH) |>
+  left_join(welch_results |> select(Compound, p_adj_BH_welch = p_adj_BH), by = "Compound") |>
+  mutate(sig_std = p_adj_BH_std < 0.05, sig_welch = p_adj_BH_welch < 0.05)
+
+table(standard = compare_sig$sig_std, welch = compare_sig$sig_welch)
+```
+
+The two approaches agree on the vast majority of compounds, so the ANOVA
+conclusions are not driven by the variance-homogeneity violation.
+
+### Significant compounds (BH-adjusted p < 0.05)
+
+```{r, fig.height=8}
+sig_compounds <- anova_results |>
+  filter(p_adj_BH < 0.05)
+
+nrow(sig_compounds)
+
+ggplot(sig_compounds, aes(x = -log10(p_adj_BH), y = reorder(Compound, -log10(p_adj_BH)))) +
+  geom_col() +
+  labs(title = "Compounds significant by Stage (one-way ANOVA, BH-adjusted)",
+       x = expression(-log[10]~ "(adjusted p-value)"), y = NULL) +
+  theme(axis.text.y = element_text(size = 10))
+```
+
+## Tukey HSD post-hoc tests on ANOVA-significant compounds
+
+The omnibus ANOVA only tells us a compound differs *somewhere* across the 5 groups. For the 42 compounds significant at BH-adjusted p < 0.05, Tukey HSD identifies *which* pairs of groups (Control, Stage 1-4) differ, with the family-wise error rate controlled within each compound's set of 10 pairwise comparisons.
+
+```{r}
+sig_compound_names <- anova_results |> filter(p_adj_BH < 0.05) |> pull(Compound)
+
+tukey_results <- lcms_long_log |>
+  filter(Compound %in% sig_compound_names) |>
+  group_by(Compound) |>
+  nest() |>
+  mutate(
+    model = map(data, ~ aov(log_abundance ~ Stage, data = .x)),
+    tukey = map(model, ~ broom::tidy(TukeyHSD(.x)))
+  ) |>
+  select(Compound, tukey) |>
+  unnest(tukey) |>
+  ungroup() |>
+  select(Compound, contrast, estimate, adj.p.value)
+
+tukey_results
+```
+
+### Which group pairs drive the differences?
+
+```{r}
+# Contrasts ending "--" involve Control (Stage level "-");
+# all others compare two cancer stages.
+contrast_summary <- tukey_results |>
+  group_by(contrast) |>
+  summarise(n_sig = sum(adj.p.value < 0.05), n_total = n(), .groups = "drop") |>
+  mutate(contrast_type = ifelse(grepl("--$", contrast), "vs Control", "Stage vs Stage")) |>
+  arrange(desc(n_sig))
+
+contrast_summary |> print()
+
+ggplot(contrast_summary, aes(x = n_sig, y = reorder(contrast, n_sig), fill = contrast_type)) +
+  geom_col() +
+  labs(title = "Significant Tukey pairs out of 42 ANOVA-significant compounds",
+       x = "Number of compounds significant (adj. p < .05)", y = "Contrast", fill = NULL)
+```
+
+Differences are concentrated in the **Control vs. cancer** comparisons
+(18-25 of 42 compounds significant for each Stage-vs-Control pair), while
+**Stage-vs-Stage** comparisons among cancer cases are rarely significant
+(0-5 of 42). This suggests the ANOVA signal detected above is driven mainly by cancer-vs-healthy differences rather than progression across cancer stages.
+
+### Compounds with a significant Stage-vs-Stage difference
+
+```{r}
+tukey_results |>
+  filter(!grepl("--$", contrast), adj.p.value < 0.05) |>
+  arrange(adj.p.value) |> arrange(contrast) |> 
+  print()
+```
+
+## Clustered correlation analysis of compounds
+
+Using `lcms_long_log` (log2 abundance for all 99 compounds x 211 samples),
+we compute pairwise **Spearman** correlations between compounds (Spearman
+rather than Pearson given the non-normality documented above) and cluster
+compounds by correlation structure (distance = 1 - correlation, average
+linkage).
+
+```{r}
+library(tidyr)
+library(tibble)
+
+log_wide <- lcms_long_log |>
+  select(Compound, sample_id, log_abundance) |>
+  pivot_wider(names_from = sample_id, values_from = log_abundance) |>
+  column_to_rownames("Compound") |>
+  as.matrix()
+
+cor_mat <- cor(t(log_wide), method = "spearman", use = "pairwise.complete.obs")
+cor_dist <- as.dist(1 - cor_mat)
+hc <- hclust(cor_dist, method = "average")
+```
+
+### Choosing the number of clusters
+
+Average silhouette width is used to check whether the data support distinct
+compound clusters, rather than picking a cluster count arbitrarily.
+
+```{r}
+library(cluster)
+
+sil_widths <- sapply(2:15, function(k) {
+  cl <- cutree(hc, k = k)
+  mean(silhouette(cl, cor_dist)[, "sil_width"])
+})
+
+data.frame(k = 2:15, avg_sil_width = round(sil_widths, 3))
+```
+
+Silhouette widths stay low (< 0.2) across all tested k, indicating the
+correlation structure among compounds is weak and diffuse rather than
+organized into a small number of tight, well-separated modules. We display
+k = 8 below for visualization, but the cluster boundaries should be read as
+descriptive groupings, not as strongly-supported distinct biological
+modules.
+
+```{r, fig.height=11, fig.width=9}
+library(pheatmap)
+
+k_clusters <- 8
+cluster_assignments <- cutree(hc, k = k_clusters)
+annotation_row <- data.frame(cluster = factor(cluster_assignments))
+rownames(annotation_row) <- names(cluster_assignments)
+
+pheatmap(
+  cor_mat,
+  clustering_distance_rows = cor_dist,
+  clustering_distance_cols = cor_dist,
+  clustering_method = "average",
+  annotation_row = annotation_row,
+  show_colnames = FALSE,
+  fontsize_row = 5,
+  main = "Spearman correlation among compounds (clustered)",
+  color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks = seq(-1, 1, length.out = 101)
+)
+```
+
+Most off-diagonal correlations are weak (near white), consistent with the
+low silhouette widths; a couple of tighter, more strongly-correlated
+sub-blocks are visible nested within the larger clusters, which may be worth
+inspecting individually (e.g. by compound class such as acylcarnitines).
+
+## Sample-sample correlation, annotated by Stage
+
+The compound-compound clustering above asks whether *compounds* group
+together. Here we instead ask whether *samples* cluster by Stage: do
+patients with the same Stage (or Control) have more similar overall
+metabolite profiles than patients in different Stages?
+
+```{r, fig.height=9, fig.width=9}
+library(tibble)
+
+sample_cor <- cor(log_wide, method = "spearman", use = "pairwise.complete.obs")
+sample_dist <- as.dist(1 - sample_cor)
+hc_samples <- hclust(sample_dist, method = "average")
+
+stage_annotation <- metadata_merged |>
+  select(sample_id, Stage) |>
+  distinct() |>
+  column_to_rownames("sample_id")
+stage_annotation <- stage_annotation[colnames(sample_cor), , drop = FALSE]
+
+stage_colors <- list(Stage = c(
+  "-" = "grey70", "1" = "#fee8c8", "2" = "#fdbb84", "3" = "#e34a33", "4" = "#7f0000"
+))
+
+pheatmap(
+  sample_cor,
+  clustering_distance_rows = sample_dist,
+  clustering_distance_cols = sample_dist,
+  clustering_method = "average",
+  annotation_row = stage_annotation,
+  annotation_col = stage_annotation,
+  annotation_colors = stage_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = "Sample-sample Spearman correlation (annotated by Stage)",
+  color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks = seq(min(sample_cor), 1, length.out = 101)
+)
+```
+
+Visually the Stage color bar does not resolve into distinct blocks along the
+dendrogram, suggesting Stage is not a dominant driver of overall sample
+similarity. We quantify this directly by comparing mean pairwise correlation
+for same-Stage vs. different-Stage sample pairs.
+
+```{r}
+cor_long <- as.data.frame(sample_cor) |>
+  rownames_to_column("sample_a") |>
+  pivot_longer(-sample_a, names_to = "sample_b", values_to = "r") |>
+  filter(sample_a != sample_b) |>
+  left_join(stage_annotation |> rownames_to_column("sample_a") |> rename(stage_a = Stage), by = "sample_a") |>
+  left_join(stage_annotation |> rownames_to_column("sample_b") |> rename(stage_b = Stage), by = "sample_b") |>
+  mutate(pair_type = ifelse(stage_a == stage_b, "same stage", "different stage"))
+
+cor_long |>
+  group_by(pair_type) |>
+  summarise(mean_r = mean(r), median_r = median(r), n_pairs = n(), .groups = "drop")
+```
+
+Mean same-Stage correlation (~0.795) is only marginally higher than mean
+different-Stage correlation (~0.789) — a difference of about 0.006, which is
+not practically meaningful given correlations in the 0.47-1.0 range overall.
+**Samples do not cluster by Stage** in their overall metabolite profile; the
+Stage-associated signal detected by the ANOVA/Tukey analysis above is
+confined to a subset of individual compounds rather than reflecting a
+broad, sample-level Stage signature.
+
+### Repeating on just the 42 ANOVA-significant compounds
+
+Since the signal detected earlier lives in a subset of compounds, restricting
+the sample-sample correlation to just those 42 compounds should make any
+Control-vs-cancer signal more visible than it was across all 99 compounds.
+
+```{r, fig.height=9, fig.width=9}
+log_wide_sig <- log_wide[rownames(log_wide) %in% sig_compound_names, ]
+
+sample_cor_sig <- cor(log_wide_sig, method = "spearman", use = "pairwise.complete.obs")
+sample_dist_sig <- as.dist(1 - sample_cor_sig)
+stage_annotation_sig <- stage_annotation[colnames(sample_cor_sig), , drop = FALSE]
+
+pheatmap(
+  sample_cor_sig,
+  clustering_distance_rows = sample_dist_sig,
+  clustering_distance_cols = sample_dist_sig,
+  clustering_method = "average",
+  annotation_row = stage_annotation_sig,
+  annotation_col = stage_annotation_sig,
+  annotation_colors = stage_colors,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = "Sample-sample Spearman correlation, 42 ANOVA-significant compounds only",
+  color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks = seq(min(sample_cor_sig), 1, length.out = 101)
+)
+```
+
+```{r}
+cor_long_sig <- as.data.frame(sample_cor_sig) |>
+  rownames_to_column("sample_a") |>
+  pivot_longer(-sample_a, names_to = "sample_b", values_to = "r") |>
+  filter(sample_a != sample_b) |>
+  left_join(stage_annotation_sig |> rownames_to_column("sample_a") |> rename(stage_a = Stage), by = "sample_a") |>
+  left_join(stage_annotation_sig |> rownames_to_column("sample_b") |> rename(stage_b = Stage), by = "sample_b") |>
+  mutate(pair_type = ifelse(stage_a == stage_b, "same stage", "different stage"))
+
+cor_long_sig |>
+  group_by(pair_type) |>
+  summarise(mean_r = mean(r), median_r = median(r), n_pairs = n(), .groups = "drop")
+
+# Collapse to Control vs Cancer to test the specific signal found by ANOVA/Tukey
+cor_long_sig |>
+  mutate(
+    group_a = ifelse(stage_a == "-", "Control", "Cancer"),
+    group_b = ifelse(stage_b == "-", "Control", "Cancer"),
+    diag_pair_type = paste(pmin(group_a, group_b), pmax(group_a, group_b), sep = " - ")
+  ) |>
+  group_by(diag_pair_type) |>
+  summarise(mean_r = mean(r), median_r = median(r), n_pairs = n(), .groups = "drop")
+```
+
+Restricting to the 42 significant compounds sharpens the pattern somewhat:
+same-Stage mean correlation (0.784) exceeds different-Stage (0.768) by about
+0.016 — small but roughly 3x the gap seen across all 99 compounds. More
+informative is the Control/Cancer split: **Cancer-Cancer** sample pairs
+correlate most strongly (mean r = 0.808), clearly above **Cancer-Control**
+(0.743) and **Control-Control** (0.757) pairs. This matches the Tukey
+result — cancer samples share a more consistent profile across these 42
+compounds than either controls do among themselves or cancer/control pairs
+do with each other — but the effect is a shift in central tendency, not a
+clean visual separation into blocks in the heatmap above, and cancer Stages
+1-4 remain thoroughly intermixed with each other.
+
+
+
+## Mean sample-sampel correlations by stage pair (42 sig metabolites)
+
+```{r}
+stage_matrix_full <- cor_long |>
+  group_by(stage_a, stage_b) |>
+  summarise(mean_r = mean(r), .groups = "drop") |>
+  pivot_wider(names_from = stage_b, values_from = mean_r)
+
+stage_matrix_sig <- cor_long_sig |>
+  group_by(stage_a, stage_b) |>
+  summarise(mean_r = mean(r), .groups = "drop") |>
+  pivot_wider(names_from = stage_b, values_from = mean_r)
+
+cat("All 99 compounds:\n")
+print(stage_matrix_full)
+```
+
+```{r}
+cat("\n42 ANOVA-significant compounds:\n")
+
+print(stage_matrix_sig)
+```
+
+```{r}
+stage_matrix_sig_long <- cor_long_sig |>
+  group_by(stage_a, stage_b) |>
+  summarise(mean_r = mean(r), .groups = "drop")
+
+ggplot(stage_matrix_sig_long, aes(x = stage_a, y = stage_b, fill = mean_r)) +
+  geom_tile() +
+  geom_text(aes(label = round(mean_r, 3)), size = 3.5) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", midpoint = 0.78) +
+  labs(title = "Mean sample-sample correlation by Stage pair (42 sig. compounds)",
+       x = "Stage", y = "Stage", fill = "mean r")
+```
+
+## PCA scores: does PC1 vs PC2 separate by Stage?
+
+The correlation analyses above show Control separates from Cancer, but
+individual cancer Stages do not separate from each other. We check whether
+a PCA scores plot shows the same pattern -- both across all 86 complete-case
+compounds, and restricted to the 42 ANOVA-significant compounds (where the
+Stage/Diagnosis signal is concentrated).
+
+`log_wide` (built above for the compound-compound correlation analysis) still
+has 13 compounds with at least one missing value; `prcomp()` requires
+complete data, so we restrict to the 86 compounds with no missing values
+rather than imputing here.
+
+```{r}
+complete_compounds <- lcms_long_log |>
+  group_by(Compound) |>
+  summarise(any_na = any(is.na(log_abundance)), .groups = "drop") |>
+  filter(!any_na) |>
+  pull(Compound)
+
+length(complete_compounds)
+
+log_wide_complete <- log_wide[rownames(log_wide) %in% complete_compounds, ]
+
+pca_fit <- prcomp(t(log_wide_complete), scale. = TRUE)
+
+pca_scores <- as.data.frame(pca_fit$x[, 1:2]) |>
+  rownames_to_column("sample_id") |>
+  left_join(metadata_merged |> select(sample_id, Diagnosis, Stage) |> distinct(), by = "sample_id")
+```
+
+```{r}
+var_pc1 <- round(summary(pca_fit)$importance[2, "PC1"] * 100, 1)
+var_pc2 <- round(summary(pca_fit)$importance[2, "PC2"] * 100, 1)
+
+stage_colors_vec <- c("-" = "grey60", "1" = "#fee8c8", "2" = "#fdbb84", "3" = "#e34a33", "4" = "#7f0000")
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = Stage)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = stage_colors_vec) +
+  labs(title = "PCA (86 compounds, complete cases)",
+       x = paste0("PC1 (", var_pc1, "%)"), y = paste0("PC2 (", var_pc2, "%)"))
+```
+
+Using all 86 complete-case compounds, PC1/PC2 (together explaining only
+~24.9% of variance) show no visible separation by Stage or Control -- points
+of every Stage are thoroughly intermixed. This makes sense: most of these
+86 compounds are not associated with Diagnosis/Stage, so their variance
+dilutes any real signal.
+
+### Restricting to the 42 ANOVA-significant compounds
+
+Missing values in 5 of the 42 compounds (57 values total, mostly
+Pentosidine) are imputed with the per-compound median for this PCA, since
+`prcomp()` requires complete data.
+
+```{r, fig.width=10, fig.height=5}
+library(tibble)
+library(patchwork)
+
+log_wide_sig_imputed <- t(apply(log_wide_sig, 1, function(x) {
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+}))
+
+pca_fit_sig <- prcomp(t(log_wide_sig_imputed), scale. = TRUE)
+var_pc1_sig <- round(summary(pca_fit_sig)$importance[2, "PC1"] * 100, 1)
+var_pc2_sig <- round(summary(pca_fit_sig)$importance[2, "PC2"] * 100, 1)
+
+pca_scores_sig <- as.data.frame(pca_fit_sig$x[, 1:2]) |>
+  rownames_to_column("sample_id") |>
+  left_join(metadata_merged |> select(sample_id, Diagnosis, Stage) |> distinct(), by = "sample_id")
+
+p_pca_sig_stage <- ggplot(pca_scores_sig, aes(x = PC1, y = PC2, color = Stage)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = stage_colors_vec) +
+  labs(title = "By Stage", x = paste0("PC1 (", var_pc1_sig, "%)"), y = paste0("PC2 (", var_pc2_sig, "%)")) + theme_bw()
+
+p_pca_sig_diag <- ggplot(pca_scores_sig, aes(x = PC1, y = PC2, color = Diagnosis)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "By Diagnosis", x = paste0("PC1 (", var_pc1_sig, "%)"), y = paste0("PC2 (", var_pc2_sig, "%)")) +
+  theme_bw()
+
+p_pca_sig_stage | p_pca_sig_diag
+```
+
+```{r}
+pca_scores_sig |>
+  group_by(Diagnosis) |>
+  summarise(mean_PC1 = mean(PC1), mean_PC2 = mean(PC2), n = n())
+
+pca_scores_sig |>
+  filter(Diagnosis == "Breast cancer") |>
+  group_by(Stage) |>
+  summarise(mean_PC1 = mean(PC1), mean_PC2 = mean(PC2), n = n())
+```
+
+Restricted to the 42 significant compounds, a pattern emerges: Control
+samples occupy mostly positive PC2 (mean PC2 = 1.51) while cancer samples
+skew negative (mean PC2 = -0.85) -- visible as Control (grey/teal) points
+concentrating in the upper region of the plot. This is consistent with the
+Control-vs-cancer signal detected by ANOVA/Tukey and the sample-correlation
+analysis. However, among cancer cases, Stages 1-4 do **not** separate from
+each other -- their mean PC1/PC2 values overlap substantially (e.g. Stage 3
+mean PC2 = -1.19 vs. Stage 4 mean PC2 = -1.10) and points of all four
+Stages are intermixed within the "cancer" region. This matches every prior
+analysis: the detectable signal in this dataset is Control vs. Cancer, not
+Stage progression.
+
+
+### Which compounds drive the PC2 (Control-vs-Cancer) separation?
+
+Since Control-vs-Cancer separates along **PC2** (not PC1) in the
+42-compound PCA, we rank compounds by the magnitude of their PC2 loading.
+
+```{r}
+loadings_sig <- as.data.frame(pca_fit_sig$rotation[, 1:2]) |>
+  rownames_to_column("Compound") |>
+  rename(loading_PC1 = PC1, loading_PC2 = PC2) |>
+  arrange(desc(abs(loading_PC2)))
+
+loadings_sig |> select(Compound, loading_PC1, loading_PC2) |> head(15)
+```
+
+To confirm these loadings correspond to a real Control-vs-Cancer
+difference (and not just an artifact of the rotation), we compare each
+top compound's actual mean log2-abundance by Diagnosis.
+
+```{r}
+top_pc2_compounds <- loadings_sig |> slice_head(n = 15) |> pull(Compound)
+
+lcms_long_log |>
+  filter(Compound %in% top_pc2_compounds) |>
+  group_by(Compound, Diagnosis) |>
+  summarise(mean_log_abundance = mean(log_abundance, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = Diagnosis, values_from = mean_log_abundance) |>
+  mutate(higher_in = ifelse(`Breast cancer` > Control, "Cancer", "Control")) |>
+  left_join(loadings_sig |> select(Compound, loading_PC2), by = "Compound") |>
+  arrange(desc(abs(loading_PC2))) |> 
+  print()
+```
+
+The top PC2 loadings are dominated by **Phenyllactic acid** and
+**Pentosidine** (both higher in Control) and **Glutamine**, **Lysine**,
+and **Sphingosine 1-phosphate** (all higher in Cancer), along with several
+medium-chain acylcarnitines (Dodecanoyl-, Octanoyl-, Hexanoyl-,
+Decanoylcarnitine). Loading sign broadly tracks actual Control-vs-Cancer
+direction for most of these compounds, but not perfectly (e.g.
+Dodecanoylcarnitine's positive loading doesn't match its higher-in-Cancer
+direction) -- expected in a multivariate rotation where a compound's PC2
+contribution reflects its correlation with *all* other compounds jointly,
+not just its own univariate Control-vs-Cancer difference. For a purely
+univariate ranking of Control-vs-Cancer effects, the ANOVA/Tukey results
+earlier in this document are the more direct reference.
+
+
+
+
+### Plotting compounds driving PC2 separation
+
+```{r, fig.height=10}
+#library(forcats)
+
+plot_data <- lcms_long_log |>
+  filter(Compound %in% top_pc2_compounds) |>
+  mutate(Compound = fct_relevel(Compound, top_pc2_compounds))
+
+ggplot(plot_data, aes(x = Diagnosis, y = log_abundance, fill = Diagnosis)) +
+  geom_boxplot(outlier.size = 0.8) +
+  facet_wrap(~Compound, scales = "free_y", ncol = 5) +
+  labs(title = "Top 15 compounds driving PC2 (Control vs Cancer separation)",
+       x = "Diagnosis", y = "log2(abundance)") +
+  theme_gray(base_size = 18) +
+  theme(legend.position = "top")
+  
+```
+
+### Significance is added via a Wilcoxon rank-sum test (Control vs. Cancer,
+appropriate given the non-normality documented earlier) per compound,
+BH-corrected across these 15 tests.
+
+```{r, fig.width=11, fig.height=8}
+library(rstatix)
+library(ggpubr)
+
+plot_data <- lcms_long_log |>
+  filter(Compound %in% top_pc2_compounds) |>
+  mutate(Compound = fct_relevel(Compound, top_pc2_compounds))
+
+stat_test <- plot_data |>
+  group_by(Compound) |>
+  wilcox_test(log_abundance ~ Diagnosis) |>
+  adjust_pvalue(method = "BH") |>
+  add_significance("p.adj") |>
+  add_xy_position(x = "Diagnosis", fun = "max", step.increase = 0.08)
+
+stat_test |> select(Compound, group1, group2, p, p.adj, p.adj.signif)
+
+ggplot(plot_data, aes(x = Diagnosis, y = log_abundance, fill = Diagnosis)) +
+  geom_boxplot(outlier.size = 0.8) +
+  stat_pvalue_manual(stat_test, label = "p.adj.signif", tip.length = 0.01, hide.ns = FALSE) +
+  facet_wrap(~Compound, scales = "free_y", ncol = 5) +
+  labs(title = "Top 15 compounds driving PC2 (Control vs Cancer separation)",
+       subtitle = "Wilcoxon rank-sum test, BH-adjusted: * p<.05, ** p<.01, *** p<.001, **** p<.0001",
+       x = NULL, y = "log2(abundance)") +
+  theme(legend.position = "top", strip.text = element_text(size = 7))
+```
+
+The boxplots confirm the direction-check table visually: Phenyllactic acid,
+Pentosidine, Glycerophosphocholine, and Progesterone are visibly higher in
+Control, while Glutamine, Lysine, and Sphingosine 1-phosphate are visibly
+higher in Cancer. All 15 remain significant after BH correction, but effect
+clarity varies -- the acylcarnitines (Dodecanoyl-, Octanoyl-, Hexanoyl-,
+Decanoylcarnitine) show the weakest significance (`*`, adj. p roughly
+0.01-0.04) and the most visually overlapping distributions, consistent with
+their weaker, less consistent contribution to PC2 noted above.
+
+## Mapping significant metabolites onto KEGG pathways
+
+The 42 ANOVA-significant compounds all have a significant Control-vs-Stage
+Tukey pair (i.e. the Control-vs-cancer-driven set identified earlier is
+identical to the full ANOVA-significant set). We map these 42 compound
+names onto KEGG compound IDs, then onto KEGG pathways, using `KEGGREST`.
+(`MetaboAnalystR` was considered for this step but skipped -- it requires a
+heavy, GitHub-only install with many Bioconductor dependencies, whereas
+KEGGREST's `compound`/`pathway` REST endpoints cover what we need directly.)
+
+Name resolution is not fully automatic: many compound names in this
+dataset don't exactly match KEGG's canonical synonyms (e.g. KEGG stores
+"Butyrylcarnitine" as "O-Butanoylcarnitine", "Homocysteic acid" as
+"L-Homocysteic acid"). We first try an exact case-insensitive match against
+KEGG's synonym list (stripping common prefixes like `O-`/`L-`/`D-`/`N6-`),
+then manually verify a handful of remaining names against candidate KEGG
+entries.
+
+```{r}
+library(KEGGREST)
+
+control_vs_cancer_sig <- tukey_results |>
+  filter(grepl("--$", contrast), adj.p.value < 0.05) |>
+  distinct(Compound) |>
+  pull(Compound)
+
+length(control_vs_cancer_sig)  # identical to the 42 ANOVA-significant compounds
+
+strip_prefixes <- function(x) {
+  x <- tolower(x)
+  x <- gsub("^(o-|l-|d-|n6-|n-|\\(r\\)-|\\(s\\)-)", "", x)
+  trimws(x)
+}
+
+resolve_kegg <- function(name) {
+  hits <- tryCatch(keggFind("compound", name), error = function(e) NULL)
+  if (is.null(hits) || length(hits) == 0) return(NA_character_)
+  target <- strip_prefixes(name)
+  for (i in seq_along(hits)) {
+    syns <- str_split(hits[i], ";")[[1]] |> str_trim() |> strip_prefixes()
+    if (any(syns == target)) return(names(hits)[i])
+  }
+  # fall back to unstripped exact match
+  for (i in seq_along(hits)) {
+    syns <- str_split(hits[i], ";")[[1]] |> str_trim()
+    if (any(tolower(syns) == tolower(name))) return(names(hits)[i])
+  }
+  NA_character_
+}
+
+kegg_map <- tibble(Compound = control_vs_cancer_sig) |>
+  mutate(kegg_id_raw = map_chr(Compound, resolve_kegg))
+
+# A handful of names needed manual verification against candidate KEGG
+# entries (e.g. confirming "Phenyllactic acid" -> C05607 "Phenyllactate",
+# not the superficially similar but biologically distinct C01207
+# "3-(3,4-Dihydroxyphenyl)lactate" that a naive fuzzy match would suggest).
+manual_matches <- c(
+  "Octanoylcarnitine" = "C02838",
+  "Butyrylcarnitine" = "C02862",
+  "Propionylcarnitine" = "C03017",
+  "Decanoylcarnitine" = "C03299",
+  "Homocysteic acid" = "C16511",
+  "Phenyllactic acid" = "C05607",
+  "6-Phosphogluconic acid" = "C00345",
+  "Delta-hydroxylysine" = "C16741"
+)
+
+kegg_map_final <- kegg_map |>
+  mutate(kegg_id = ifelse(is.na(kegg_id_raw), manual_matches[Compound], kegg_id_raw)) |>
+  select(Compound, kegg_id)
+
+kegg_map_final |> count(matched = !is.na(kegg_id))
+kegg_map_final |> filter(is.na(kegg_id))
+```
+
+29 of 42 compounds (69%) resolve to a KEGG compound ID. The 13 that don't
+were checked against multiple synonym variants each and genuinely have no
+entry in KEGG's compound database -- mostly longer-chain acylcarnitines
+(Dodecanoyl-, Hexanoyl-, Stearoyl-, Tetradecanoylcarnitine, Linoleyl
+carnitine, oleoylcarnitine, trans-Hexadec-2-enoyl carnitine), the free form
+of Pentosidine (only a protein-bound form, `[Protein]-pentosidine`, exists
+in KEGG), and a few others (3-Indolepropionic acid, 3-Pyridylacetic acid,
+Bisnorcholic acid, Succinyladenosine, 4,8-dimethylnonanoyl carnitine). This
+is a genuine coverage gap in KEGG (it curates core metabolic pathway
+compounds rather than the full space of lipid/exotic metabolite species),
+not a search failure.
+
+### Which pathways do the mapped compounds belong to?
+
+Generic KEGG overview/global maps (e.g. "Metabolic pathways",
+"Biosynthesis of secondary metabolites") are excluded, since they aren't
+specific enough to be informative.
+
+```{r}
+EXCLUDE <- c(
+  "map01100", "map01110", "map01120", "map01200", "map01210", "map01230",
+  "map01240", "map01250", "map01220", "map01310", "map01320",
+  "map01060", "map01061", "map01062", "map01063", "map01064", "map01065",
+  "map01066", "map01070", "map00996", "map00997", "map00998", "map00999",
+  "map00975", "map02010", "map02020"
+)
+
+mapped_ids <- kegg_map_final |> filter(!is.na(kegg_id)) |> pull(kegg_id)
+pathway_links <- keggLink("pathway", mapped_ids)
+
+path_names_raw <- keggList("pathway", "hsa")
+path_names <- tibble(
+  path = paste0("map", substr(names(path_names_raw), 4, 8)),
+  pathway_name = sub(" - Homo sapiens.*", "", path_names_raw)
+) |> distinct(path, .keep_all = TRUE)
+
+pathway_df <- tibble(
+  cpd = sub("^cpd:", "", names(pathway_links)),
+  path = sub("^path:", "", pathway_links)
+) |>
+  filter(!path %in% EXCLUDE) |>
+  left_join(kegg_map_final |> rename(cpd = kegg_id), by = "cpd") |>
+  left_join(path_names, by = "path") |>
+  mutate(pathway_name = ifelse(is.na(pathway_name), path, pathway_name))
+
+pathway_summary <- pathway_df |>
+  group_by(path, pathway_name) |>
+  summarise(
+    n_compounds = n_distinct(Compound),
+    compounds = paste(sort(unique(Compound)), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_compounds))
+
+pathway_summary |> select(pathway_name, n_compounds, compounds)
+```
+
+```{r, fig.height=6}
+plot_df <- pathway_summary |> filter(n_compounds >= 2) |> arrange(n_compounds)
+
+ggplot(plot_df, aes(x = n_compounds, y = reorder(pathway_name, n_compounds))) +
+  geom_col() +
+  labs(title = "KEGG pathways containing >=2 of the 29 mapped, significant compounds",
+       x = "Number of compounds", y = NULL)
+```
+
+The mapped compounds are spread thinly across many pathways -- most
+pathways contain only 1-2 of our compounds, reflecting that these 29
+metabolites span diverse core metabolic processes (amino acid, lipid,
+nucleotide, and steroid metabolism) rather than concentrating in one
+pathway. A few pathways of note given breast-cancer relevance: **Choline
+metabolism in cancer**, **Pathways in cancer**, and **Prostate cancer**
+each contain 2 compounds, and **Steroid hormone biosynthesis** /
+**Ovarian steroidogenesis** (Androstenedione, Progesterone) reflect the
+hormone-related compounds in the panel. This mapping is descriptive; it
+does not yet test whether any pathway is significantly *over-represented*
+relative to chance (that would require a formal enrichment test, e.g. a
+hypergeometric test against a defined background, as a natural next step).
+
+### Formal hypergeometric enrichment test
+
+As discussed earlier, the background ("population") for this test is the
+**99 compounds actually measured on this platform** -- not the full KEGG
+compound database -- since testing against the full KEGG universe would
+overstate significance for pathways that happen to overlap with what this
+assay can detect. We map all 99 compounds to KEGG IDs (reusing the
+manually-verified IDs from the 42 significant compounds above; the
+remaining ~57 non-significant compounds use automated matching only, since
+they don't need the same scrutiny as the compounds driving our
+conclusions).
+
+```{r}
+all_99_compounds <- unique(lcms_long$Compound)
+
+kegg_map_all <- tibble(Compound = all_99_compounds) |>
+  mutate(kegg_id_raw = map_chr(Compound, resolve_kegg)) |>
+  mutate(kegg_id = ifelse(is.na(kegg_id_raw) & Compound %in% names(manual_matches),
+                           manual_matches[Compound], kegg_id_raw)) |>
+  select(Compound, kegg_id)
+
+# Prefer the manually-verified IDs for the 42 significant compounds
+kegg_map_universe <- kegg_map_all |>
+  left_join(kegg_map_final |> rename(kegg_id_verified = kegg_id), by = "Compound") |>
+  mutate(kegg_id = coalesce(kegg_id_verified, kegg_id)) |>
+  select(Compound, kegg_id)
+
+sum(!is.na(kegg_map_universe$kegg_id))  # of 99 total
+```
+
+61 of 99 measured compounds (62%) resolve to a KEGG ID -- a similar hit
+rate to the 42-compound panel. We retrieve pathway links for this full
+background set, then run a one-sided hypergeometric test per pathway:
+given `n_population` background compounds with a pathway annotation,
+`n_sample` of which are our significant compounds, and `K` background
+compounds in a given pathway, what's the probability of seeing `k` or more
+significant compounds in that pathway by chance?
+
+```{r}
+bg_ids <- kegg_map_universe |> filter(!is.na(kegg_id)) |> pull(kegg_id)
+bg_pathway_links <- keggLink("pathway", bg_ids)
+
+bg_pathway_df <- tibble(
+  cpd = sub("^cpd:", "", names(bg_pathway_links)),
+  path = sub("^path:", "", bg_pathway_links)
+) |>
+  filter(!path %in% EXCLUDE) |>
+  left_join(kegg_map_universe |> rename(cpd = kegg_id), by = "cpd")
+
+n_population <- bg_pathway_df |> distinct(Compound) |> nrow()
+n_sample <- pathway_df |> distinct(Compound) |> nrow()
+
+bg_counts <- bg_pathway_df |>
+  group_by(path) |>
+  summarise(K = n_distinct(Compound), .groups = "drop")
+
+hit_counts <- pathway_df |>
+  group_by(path, pathway_name) |>
+  summarise(k = n_distinct(Compound),
+            hit_compounds = paste(sort(unique(Compound)), collapse = ", "),
+            .groups = "drop")
+
+enrichment <- hit_counts |>
+  left_join(bg_counts, by = "path") |>
+  mutate(
+    p_value = phyper(k - 1, K, n_population - K, n_sample, lower.tail = FALSE),
+    p_adj = p.adjust(p_value, method = "BH")
+  ) |>
+  arrange(p_value)
+
+n_sample      # significant, pathway-annotated compounds tested
+n_population  # background, pathway-annotated compounds tested
+
+enrichment |> select(pathway_name, k, K, p_value, p_adj, hit_compounds) |> head(10)
+```
+
+**No pathway reaches significance after BH correction** -- the best
+nominal p-value (Neuroactive ligand-receptor interaction, 3/3 hit
+compounds) is 0.084, which becomes 0.65 after adjusting for the 83
+pathways tested. This null result should be taken at face value rather
+than over-interpreted from the raw ranking: only 22 of the 42 significant
+compounds have any non-generic KEGG pathway annotation, tested against a
+49-compound background -- a very small sample for a hypergeometric test to
+have meaningful power. This mirrors a common limitation in untargeted
+metabolomics pathway analysis: incomplete database coverage of measured
+compounds constrains not just compound identification but also downstream
+enrichment power, and the platform-specific background (however more
+statistically appropriate than the full KEGG universe) further reduces the
+population size available for testing. The pathway *mapping* above remains
+useful as a descriptive/hypothesis-generating summary; it should not be
+read as demonstrating statistically-supported pathway-level dysregulation.
+
+### Sensitivity check: full KEGG compound database as background
+
+For contrast, we rerun the identical test but swap the background for the
+**entire KEGG compound universe** (all compounds appearing in any
+non-generic pathway map) instead of the 99 measured compounds. This is the
+default in many enrichment tools, but it is the **less conservative,
+less defensible** choice here: it implicitly assumes our assay could have
+detected any KEGG compound, which is false for a targeted panel, and it
+therefore tends to overstate significance.
+
+```{r}
+bg_all_raw <- keggLink("pathway", "compound")
+
+bg_all <- tibble(
+  cpd  = sub("^cpd:", "", names(bg_all_raw)),
+  path = sub("^path:", "", bg_all_raw)
+) |>
+  filter(grepl("^map", path), !path %in% EXCLUDE)
+
+n_population_full <- bg_all |> distinct(cpd) |> nrow()
+
+bg_counts_full <- bg_all |>
+  group_by(path) |>
+  summarise(K = n_distinct(cpd), .groups = "drop")
+
+enrichment_full <- hit_counts |>
+  left_join(bg_counts_full, by = "path") |>
+  mutate(
+    p_value = phyper(k - 1, K, n_population_full - K, n_sample, lower.tail = FALSE),
+    p_adj   = p.adjust(p_value, method = "BH")
+  ) |>
+  arrange(p_value)
+
+n_population_full                          # full-KEGG background size
+sum(enrichment_full$p_adj < 0.05)          # pathways significant after BH
+
+enrichment_full |> select(pathway_name, k, K, p_value, p_adj, hit_compounds) |> head(15)
+```
+
+Against the full KEGG background (`r n_population_full` compounds), the
+**conclusion flips: 11 pathways now pass BH correction at p_adj < 0.05**,
+including Glyoxylate and dicarboxylate metabolism, Choline metabolism in
+cancer, Prolactin signaling, Prostate cancer, D-amino acid metabolism,
+Ovarian steroidogenesis, Alanine/aspartate/glutamate metabolism, and
+Pathways in cancer. The *hit compounds* are identical to the descriptive
+mapping -- what changed is only the denominator. With ~6,300 background
+compounds instead of 49, finding 2-4 of our compounds concentrated in a
+small pathway looks far more surprising by chance, so the p-values shrink
+dramatically.
+
+This side-by-side is the whole point of the background-choice discussion:
+the *same data* yields "nothing significant" or "11 significant pathways"
+depending entirely on the reference set. The platform-restricted background
+(previous section) is the more honest choice for a targeted panel, so these
+11 hits should be read as **suggestive, not confirmatory** -- the full-KEGG
+result is best treated as an upper bound on what enrichment might look like
+with a fully-annotated, untargeted platform.
+
+## Predictive modeling: classifying Control vs. Cancer with PLS-DA
+
+Every analysis above points to a Control-vs-Cancer signal (not stage). Here
+we test how well that signal supports *classification* of an individual
+sample as Control or Breast cancer, using PLS-DA (partial least squares
+discriminant analysis) -- a standard supervised method for high-dimensional,
+correlated metabolomics predictors.
+
+**Avoiding feature-selection leakage.** The 42 "significant" compounds were
+chosen using an ANOVA on the *full* dataset. If we simply fed those into a
+classifier and evaluated on a held-out subset, the test set would have
+already influenced feature selection, inflating apparent performance. To
+avoid this, we split first, then re-run the ANOVA/BH selection **using only
+the training set**, so the test set plays no role in choosing predictors.
+
+### Train/test split and leakage-free feature selection
+
+```{r}
+library(tidymodels)
+library(plsmod)
+library(tibble)
+
+# Wide design matrix: all 99 compounds (log2) x samples, outcome = Diagnosis
+modeling_df <- lcms_long_log |>
+  select(Compound, sample_id, log_abundance) |>
+  pivot_wider(names_from = Compound, values_from = log_abundance) |>
+  left_join(metadata_merged |> select(sample_id, Diagnosis) |> distinct(),
+            by = "sample_id") |>
+  mutate(Diagnosis = factor(Diagnosis, levels = c("Control", "Breast cancer"))) |>
+  column_to_rownames("sample_id")
+
+set.seed(4127)
+split <- initial_split(modeling_df, strata = Diagnosis)
+train <- training(split)
+test  <- testing(split)
+
+# Re-select significant compounds using TRAINING DATA ONLY
+train_ids <- rownames(train)
+anova_results_train <- lcms_long_log |>
+  filter(sample_id %in% train_ids) |>
+  group_by(Compound) |>
+  nest() |>
+  mutate(
+    model = map(data, ~ aov(log_abundance ~ Stage, data = .x)),
+    tidy_model = map(model, broom::tidy)
+  ) |>
+  select(Compound, tidy_model) |>
+  unnest(tidy_model) |>
+  filter(term == "Stage") |>
+  ungroup() |>
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH"))
+
+predictor_cols <- anova_results_train |> filter(p_adj_BH < 0.05) |> pull(Compound)
+length(predictor_cols)  # training-only significant compounds
+
+train_final <- train[, c(predictor_cols, "Diagnosis")]
+test_final  <- test[, c(predictor_cols, "Diagnosis")]
+```
+
+Training-only selection yields 27 compounds (fewer than the 42 from the full
+data, as expected with a smaller sample), all of which are a subset of the
+original 42.
+
+### Cross-validation setup and null baseline
+
+```{r}
+set.seed(6183)
+folds <- vfold_cv(train_final, v = 10, strata = Diagnosis)
+
+metrics_class <- metric_set(roc_auc, accuracy, brier_class)
+
+# Null baseline: always predicts the majority class
+null_wf <- workflow() |>
+  add_recipe(recipe(Diagnosis ~ ., data = train_final) |>
+               step_impute_median(all_numeric_predictors())) |>
+  add_model(null_model(mode = "classification") |> set_engine("parsnip"))
+
+null_res <- fit_resamples(null_wf, resamples = folds, metrics = metrics_class)
+collect_metrics(null_res) |> select(.metric, mean, std_err)
+```
+
+The class split is 64% cancer / 36% control, so the null model reaches
+0.64 accuracy but ROC AUC of exactly 0.50 -- it has no discriminative
+ability, which is the bar PLS-DA must clear.
+
+### PLS-DA: tuning the number of components
+
+Missing values (Pentosidine, Phenyllactic acid) are median-imputed and
+predictors normalized inside the recipe, so both are refit within each
+resample fold. The only hyperparameter is the number of latent components.
+
+```{r}
+pls_wf <- workflow() |>
+  add_recipe(
+    recipe(Diagnosis ~ ., data = train_final) |>
+      step_impute_median(all_numeric_predictors()) |>
+      step_normalize(all_numeric_predictors())
+  ) |>
+  add_model(pls(num_comp = tune()) |> set_engine("mixOmics") |> set_mode("classification"))
+
+set.seed(7321)
+pls_tune <- tune_grid(
+  pls_wf,
+  resamples = folds,
+  grid = tibble(num_comp = 1:10),
+  metrics = metrics_class
+)
+
+collect_metrics(pls_tune) |>
+  filter(.metric == "roc_auc") |>
+  select(num_comp, mean, std_err) |>
+  arrange(desc(mean))
+```
+
+ROC AUC peaks at `num_comp = 2` (CV mean 0.985) and is essentially flat for
+2-6 components, so we take the most parsimonious choice, 2 components.
+
+### Final model: held-out test-set evaluation
+
+```{r}
+pls_final_wf <- finalize_workflow(pls_wf, tibble(num_comp = 2))
+
+cv_metrics <- collect_metrics(pls_tune) |>
+  filter(num_comp == 2) |>
+  select(.metric, cv_mean = mean, cv_std_err = std_err)
+
+pls_fit <- fit(pls_final_wf, data = train_final)
+
+test_pred <- test_final |>
+  bind_cols(predict(pls_fit, test_final, type = "prob")) |>
+  bind_cols(predict(pls_fit, test_final, type = "class"))
+
+test_metrics <- bind_rows(
+  roc_auc(test_pred, truth = Diagnosis, .pred_Control),
+  accuracy(test_pred, truth = Diagnosis, .pred_class),
+  brier_class(test_pred, truth = Diagnosis, .pred_Control)
+) |>
+  select(.metric, test = .estimate)
+
+cv_metrics |> left_join(test_metrics, by = ".metric")
+conf_mat(test_pred, truth = Diagnosis, estimate = .pred_class)
+```
+
+```{r, fig.width=5, fig.height=5}
+roc_curve(test_pred, truth = Diagnosis, .pred_Control) |>
+  autoplot() +
+  labs(title = "PLS-DA test-set ROC (Control vs Breast cancer)",
+       subtitle = "num_comp = 2, 27 training-selected compounds")
+```
+
+The final model generalizes well: **test-set ROC AUC 0.95, accuracy 0.96,
+Brier score 0.13**, versus the null baseline's AUC of 0.50 and accuracy
+0.64. Test metrics closely track the cross-validation estimates (CV AUC
+0.985), indicating little overfitting. On the 53 held-out samples, all 34
+cancer cases were correctly classified (perfect sensitivity) and 17 of 19
+controls were correct (2 controls misclassified as cancer).
+
+**Caveats.** (1) The held-out test evaluation is honest with respect to the
+*test* set -- it played no role in feature selection or fitting -- but the
+cross-validation AUC is mildly optimistic because feature selection was done
+once on the whole training set rather than re-run inside each CV fold; the
+test-set number is the estimate to trust. (2) This classifies Control vs.
+Cancer, the signal we established is real; it does **not** predict stage,
+consistent with every earlier result. (3) With only 19 controls in the test
+set, the specificity estimate (17/19 = 0.89) has a wide confidence interval,
+so the two control misclassifications shouldn't be over-interpreted.
+
+## Stage-specific models: predicting each Cancer Stage vs. Control
+
+Every analysis above (ANOVA/Tukey, sample-sample correlation, PCA) shows the
+same pattern: each cancer Stage separates from Control, but Stages 1-4 do not
+separate well from *each other*. A single 5-way classifier (Control vs.
+Stage 1 vs. 2 vs. 3 vs. 4) would be fighting that structure. Instead we build
+**four independent binary PLS-DA models** -- Stage 1 vs Control, Stage 2 vs
+Control, Stage 3 vs Control, Stage 4 vs Control -- each trained and evaluated
+only on Control samples plus that one cancer stage, using Healthy Control as
+the shared negative class throughout.
+
+Each model repeats the same leakage-free procedure as the Control-vs-Cancer
+PLS-DA above: split into train/test first, then re-run ANOVA + BH selection
+**using only that model's training samples** to pick predictors, then tune
+a PLS-DA classifier's number of components. Folds are reduced from 10 to 5
+because some per-stage training sets are small (Stage 1 has only 19 cancer
+cases in total).
+
+```{r}
+library(tidymodels)
+library(plsmod)
+library(broom)
+library(tibble)
+
+fit_stage_vs_control <- function(stage_level, seed_split = 4127, seed_cv = 6183, seed_tune = 7321) {
+
+  df_stage <- lcms_long_log |>
+    filter(Stage %in% c("-", stage_level)) |>
+    select(Compound, sample_id, log_abundance) |>
+    pivot_wider(names_from = Compound, values_from = log_abundance) |>
+    left_join(metadata_merged |> select(sample_id, Stage) |> distinct(), by = "sample_id") |>
+    mutate(Stage = factor(ifelse(Stage == "-", "Control", paste0("Stage", stage_level)),
+                           levels = c("Control", paste0("Stage", stage_level)))) |>
+    column_to_rownames("sample_id")
+
+  set.seed(seed_split)
+  split <- initial_split(df_stage, strata = Stage)
+  train <- training(split)
+  test  <- testing(split)
+
+  # Re-select significant compounds using TRAINING DATA ONLY for this stage's contrast
+  train_ids <- rownames(train)
+  anova_train <- lcms_long_log |>
+    filter(sample_id %in% train_ids) |>
+    mutate(Stage = droplevels(Stage)) |>
+    group_by(Compound) |>
+    nest() |>
+    mutate(
+      model = map(data, ~ aov(log_abundance ~ Stage, data = .x)),
+      tidy_model = map(model, broom::tidy)
+    ) |>
+    select(Compound, tidy_model) |>
+    unnest(tidy_model) |>
+    filter(term == "Stage") |>
+    ungroup() |>
+    mutate(p_adj_BH = p.adjust(p.value, method = "BH"))
+
+  predictor_cols <- anova_train |> filter(p_adj_BH < 0.05) |> pull(Compound)
+  # Fallback to nominal p < .05 if BH leaves nothing (guards the smallest stages)
+  if (length(predictor_cols) == 0) {
+    predictor_cols <- anova_train |> filter(p.value < 0.05) |> pull(Compound)
+  }
+
+  train_final <- train[, c(predictor_cols, "Stage")]
+  test_final  <- test[, c(predictor_cols, "Stage")]
+
+  set.seed(seed_cv)
+  folds <- vfold_cv(train_final, v = 5, strata = Stage)
+  metrics_class <- metric_set(roc_auc, accuracy, brier_class)
+  max_comp <- min(10, length(predictor_cols))
+
+  pls_wf <- workflow() |>
+    add_recipe(
+      recipe(Stage ~ ., data = train_final) |>
+        step_impute_median(all_numeric_predictors()) |>
+        step_normalize(all_numeric_predictors())
+    ) |>
+    add_model(pls(num_comp = tune()) |> set_engine("mixOmics") |> set_mode("classification"))
+
+  set.seed(seed_tune)
+  pls_tune <- tune_grid(
+    pls_wf, resamples = folds,
+    grid = tibble(num_comp = 1:max_comp),
+    metrics = metrics_class
+  )
+
+  best_comp <- collect_metrics(pls_tune) |>
+    filter(.metric == "roc_auc") |>
+    slice_max(mean, n = 1, with_ties = FALSE) |>
+    pull(num_comp)
+
+  pls_final_wf <- finalize_workflow(pls_wf, tibble(num_comp = best_comp))
+  pls_fit <- fit(pls_final_wf, data = train_final)
+
+  test_pred <- test_final |>
+    bind_cols(predict(pls_fit, test_final, type = "prob")) |>
+    bind_cols(predict(pls_fit, test_final, type = "class"))
+
+  stage_label <- paste0("Stage", stage_level)
+  test_metrics <- bind_rows(
+    roc_auc(test_pred, truth = Stage, .pred_Control),
+    accuracy(test_pred, truth = Stage, .pred_class),
+    brier_class(test_pred, truth = Stage, .pred_Control)
+  ) |>
+    mutate(stage = stage_label)
+
+  list(
+    stage = stage_label,
+    n_train = nrow(train_final), n_test = nrow(test_final),
+    n_predictors = length(predictor_cols), predictors = predictor_cols,
+    best_comp = best_comp, test_metrics = test_metrics, test_pred = test_pred,
+    conf_mat = conf_mat(test_pred, truth = Stage, estimate = .pred_class)
+  )
+}
+
+stage_results <- map(c("1", "2", "3", "4"), fit_stage_vs_control)
+names(stage_results) <- paste0("Stage", c("1", "2", "3", "4"))
+```
+
+### Test-set performance by stage
+
+```{r}
+map_dfr(stage_results, ~ tibble(
+  stage = .x$stage, n_train = .x$n_train, n_test = .x$n_test,
+  n_predictors = .x$n_predictors, num_comp = .x$best_comp
+))
+
+map_dfr(stage_results, ~ .x$test_metrics) |>
+  select(stage, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+walk(stage_results, ~ {
+  cat("\n", .x$stage, "vs Control:\n")
+  print(.x$conf_mat)
+})
+```
+
+All four models beat the Control-vs-Cancer null baseline (AUC 0.50) by a wide
+margin, but performance is not uniform: **Stage 1** (24 predictors, 4
+components) reaches AUC 0.99 / accuracy 0.92 (22/24, with one misclassification
+in each direction on a test set of only 5 Stage 1 cases); **Stage 2** (18
+predictors, 3 components) is the weakest of the four at AUC 0.87 / accuracy
+0.88 (28/32), missing 4 of 13 Stage 2 test cases as false negatives while
+Control specificity stays perfect; **Stage 3** (14 predictors, 5 components)
+achieves perfect test-set separation (AUC 1.00 / accuracy 1.00, 31/31); and
+**Stage 4** (19 predictors, 2 components) reaches AUC 1.00 / accuracy 0.92
+(22/24), correctly classifying all 5 Stage 4 test cases (perfect sensitivity)
+but misclassifying 2 of 19 controls as Stage 4.
+
+### ROC curves
+
+```{r, fig.width=8, fig.height=7}
+roc_data <- map_dfr(stage_results, function(x) {
+  roc_curve(x$test_pred, truth = Stage, .pred_Control) |> mutate(stage = x$stage)
+})
+
+ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path() +
+  geom_abline(lty = 3, color = "grey60") +
+  facet_wrap(~stage) +
+  coord_equal() +
+  labs(title = "Stage-specific PLS-DA test-set ROC curves (each Stage vs Control)")
+```
+
+### Which compounds recur across stage-specific models?
+
+```{r}
+predictor_sets <- map(stage_results, "predictors")
+
+predictor_overlap <- tibble(Compound = unique(unlist(predictor_sets))) |>
+  mutate(
+    Stage1 = Compound %in% predictor_sets$Stage1,
+    Stage2 = Compound %in% predictor_sets$Stage2,
+    Stage3 = Compound %in% predictor_sets$Stage3,
+    Stage4 = Compound %in% predictor_sets$Stage4,
+    n_stages = Stage1 + Stage2 + Stage3 + Stage4
+  ) |>
+  arrange(desc(n_stages))
+
+predictor_overlap |> filter(n_stages >= 3)
+```
+
+Four compounds -- **Glutamine, Glycerophosphocholine, Pentosidine, and
+Sphingosine 1-phosphate** -- are selected as significant predictors in
+*every* stage-specific model. These are the same compounds flagged earlier as
+top PC2 loadings driving the global Control-vs-Cancer separation, which is a
+useful consistency check: the signal identified independently at every stage
+converges on the same small set of "always-on" Control-vs-Cancer markers,
+on top of a larger set of stage-specific compounds that vary from model to
+model.
+
+**Caveats.** (1) Each stage model is trained and evaluated independently; the
+four classifiers were never trained to distinguish stages from one another,
+so a genuinely new sample could in principle score "positive" under more than
+one stage model at once -- these are four separate Stage-vs-Control screens,
+not a single mutually-exclusive multi-way classifier. (2) Per-stage test sets
+are small, especially for Stage 1 and Stage 4 (5 cancer cases each in the
+test set); Stage 2 and Stage 3 have more test cases (13 and 12 respectively)
+and give more stable estimates. (3) As with the global Control-vs-Cancer
+model, `num_comp` was tuned once per stage rather than re-tuned inside each
+CV fold, so cross-validation metrics would be mildly optimistic -- the
+held-out test metrics reported above are the ones to trust. (4) Stage 2 shows
+the weakest separation from Control (AUC 0.87 vs. ~0.99-1.00 for the other
+three stages) despite having the largest cancer sample size of the four --
+worth flagging as a stage that may need more samples or additional
+predictors to resolve confidently, rather than concluding it is inherently
+less metabolically distinct from Control.
+
+
+
+## Receptor data
+
+```{r}
+receptor <- metadata_csv |>
+  transmute(
+    sample_id = `Sample name`,
+    Diagnosis,
+    ER  = case_when(ER == "1" ~ "ER+",  ER == "-" ~ "ER-",  TRUE ~ NA_character_),
+    PR  = case_when(PR == "1" ~ "PR+",  PR == "-" ~ "PR-",  TRUE ~ NA_character_),
+    HER2 = case_when(`HER-2 neu` == "1" ~ "HER2+", `HER-2 neu` == "-" ~ "HER2-", TRUE ~ NA_character_)
+  ) |>
+  filter(Diagnosis == "Breast cancer")
+
+nrow(receptor)
+```
+
+
+```{r}
+receptor |> count(ER)
+receptor |> count(PR)
+receptor |> count(HER2)
+```
+
+```{r}
+cancer_ids <- receptor$sample_id
+lw_cancer <- log_wide[, cancer_ids]
+lw_cancer_imp <- t(apply(lw_cancer, 1, function(x) { x[is.na(x)] <- median(x, na.rm = TRUE); x }))
+
+pca_cancer <- prcomp(t(lw_cancer_imp), scale. = TRUE)
+vp1 <- round(summary(pca_cancer)$importance[2, "PC1"] * 100, 1)
+vp2 <- round(summary(pca_cancer)$importance[2, "PC2"] * 100, 1)
+
+scores_cancer <- as.data.frame(pca_cancer$x[, 1:2]) |>
+  rownames_to_column("sample_id") |>
+  left_join(receptor, by = "sample_id")
+
+mk <- function(colvar) {
+  d <- scores_cancer |> filter(!is.na(.data[[colvar]]))
+  ggplot(d, aes(PC1, PC2, color = .data[[colvar]])) +
+    geom_point(alpha = 0.8) +
+    labs(title = colvar, x = paste0("PC1 (", vp1, "%)"), y = paste0("PC2 (", vp2, "%)"), color = NULL)
+}
+
+mk("ER") | mk("PR") | mk("HER2")
+```
+
+No gross separation by ER, PR, or HER-2 status appears in the top two principal components — the groups are thoroughly intermixed in all three panels. But I'd be cautious reading too much into this: PC1/PC2 capture only 23.6% of the variance across all 99 compounds, and recall the Control-vs-Cancer signal itself was invisible in the full-compound PCA and only emerged once we restricted to the significant compounds and looked at PC2. So this plot argues against a large, global receptor effect, but it does not rule out differences in individual compounds.
+
+
+## Adding clinical covariates: receptor status, Age, and BMI
+
+The receptor panels above test ER/PR/HER2 one at a time and don't account for
+Age or BMI, both of which can independently shift metabolite levels and so
+could confound a raw receptor-status comparison. Here we (1) collapse
+ER/PR/HER2 into a single, better-powered **Receptor+ vs Triple-negative**
+contrast, and (2) fit a covariate-adjusted linear regression per compound --
+`log_abundance ~ HR_status + Age + BMI` -- so the receptor-status effect is
+estimated *after* controlling for Age and BMI.
+
+`metadata_merged` already carries the raw `ER`, `PR`, `HER-2 neu`,
+`Age (BOD-OD)` (age at blood draw -- the biologically relevant age here, as
+opposed to `Age (now)`, which is a data-collection-year artifact for Control
+rows) and `BMI` columns; they were never dropped by the earlier
+`select(-ends_with(...))` step. `lcms_long_log` inherits them too, so before
+joining our derived covariates we select down to just `Compound`,
+`sample_id`, `log_abundance` -- otherwise the join produces `BMI.x`/`BMI.y`-style
+duplicates instead of a single usable `BMI` column.
+
+```{r}
+receptor_full <- metadata_merged |>
+  filter(Diagnosis == "Breast cancer") |>
+  transmute(
+    sample_id,
+    ER   = case_when(ER == "1" ~ "ER+",  ER == "-" ~ "ER-",  TRUE ~ NA_character_),
+    PR   = case_when(PR == "1" ~ "PR+",  PR == "-" ~ "PR-",  TRUE ~ NA_character_),
+    HER2 = case_when(`HER-2 neu` == "1" ~ "HER2+", `HER-2 neu` == "-" ~ "HER2-", TRUE ~ NA_character_),
+    Age  = `Age (BOD-OD)`,
+    BMI
+  ) |>
+  mutate(
+    HR_status = case_when(
+      ER == "ER+" | PR == "PR+" | HER2 == "HER2+" ~ "Receptor+",
+      ER == "ER-" & PR == "PR-" & HER2 == "HER2-" ~ "Triple-negative",
+      TRUE ~ NA_character_
+    ),
+    HR_status = factor(HR_status, levels = c("Receptor+", "Triple-negative"))
+  ) |>
+  filter(!is.na(HR_status), !is.na(Age), !is.na(BMI))
+
+nrow(receptor_full)
+receptor_full |> count(HR_status)
+
+lcms_receptor <- lcms_long_log |>
+  select(Compound, sample_id, log_abundance) |>
+  inner_join(receptor_full, by = "sample_id")
+```
+
+119 of the 135 cancer samples have complete ER/PR/HER2/Age/BMI data (16
+excluded: 10 missing at least one receptor call, 10 missing BMI, with some
+overlap), splitting 95 Receptor+ vs 24 Triple-negative -- still imbalanced,
+but a cleaner two-group contrast than three separate binary receptor calls.
+
+### Linear regression: a single compound worked example
+
+```{r}
+glutamine_fit <- lm(log_abundance ~ HR_status + Age + BMI,
+                     data = lcms_receptor |> filter(Compound == "Glutamine"))
+summary(glutamine_fit)
+```
+
+For Glutamine, none of the three covariates reach significance individually
+(HR status p = .25, Age p = .13, BMI p = .32), and the full model explains
+only 5% of variance (adjusted R² = 0.028) -- Glutamine's earlier
+Control-vs-Cancer signal doesn't extend to a within-cancer receptor/age/BMI
+effect.
+
+### Systematic per-compound regression, BH-corrected
+
+```{r}
+lm_results <- lcms_receptor |>
+  group_by(Compound) |>
+  nest() |>
+  mutate(
+    model = map(data, ~ lm(log_abundance ~ HR_status + Age + BMI, data = .x)),
+    tidy_model = map(model, broom::tidy)
+  ) |>
+  select(Compound, tidy_model) |>
+  unnest(tidy_model) |>
+  ungroup()
+
+hr_effect <- lm_results |>
+  filter(term == "HR_statusTriple-negative") |>
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) |>
+  arrange(p_adj_BH)
+
+age_effect <- lm_results |>
+  filter(term == "Age") |>
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) |>
+  arrange(p_adj_BH)
+
+bmi_effect <- lm_results |>
+  filter(term == "BMI") |>
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) |>
+  arrange(p_adj_BH)
+
+cat("HR status -- significant (BH < .05):", sum(hr_effect$p_adj_BH < 0.05), "of 99\n")
+cat("Age       -- significant (BH < .05):", sum(age_effect$p_adj_BH < 0.05), "of 99\n")
+cat("BMI       -- significant (BH < .05):", sum(bmi_effect$p_adj_BH < 0.05), "of 99\n")
+
+age_effect |> select(Compound, estimate, p.value, p_adj_BH) |> head(9)
+```
+
+**Receptor status: 0 of 99 compounds** remain significant after BH
+correction -- consistent with the PCA panels above showing no gross
+receptor-status separation, and now confirmed at the individual-compound
+level even after adjusting for Age and BMI. **BMI: 0 of 99** compounds
+survive correction either (a handful have nominal p < .01, e.g.
+3-Indolepropionic acid, Phenyllactic acid, Succinyladenosine, but none
+withstand testing across 99 compounds). **Age is the one covariate with a
+real signal: 9 of 99 compounds** remain significant after BH correction,
+led by Quinic acid, *trans*-Hexadec-2-enoyl carnitine, Tetradecanoylcarnitine,
+Androstenedione, and Glycolaldehyde (all p_adj < .01) -- an age-related
+metabolite signature independent of receptor status, worth keeping in mind
+as a potential confounder in any future model that doesn't explicitly
+adjust for it.
+
+### Repeating the receptor PCA with the collapsed HR+ / Triple-negative contrast
+
+```{r, fig.width=5, fig.height=4}
+scores_cancer_hr <- scores_cancer |>
+  left_join(receptor_full |> select(sample_id, HR_status), by = "sample_id")
+
+ggplot(scores_cancer_hr |> filter(!is.na(HR_status)), aes(PC1, PC2, color = HR_status)) +
+  geom_point(alpha = 0.8) +
+  labs(title = "HR status (Receptor+ vs Triple-negative)",
+       x = paste0("PC1 (", vp1, "%)"), y = paste0("PC2 (", vp2, "%)"), color = NULL)
+```
+
+As with the three-way ER/PR/HER2 split, the collapsed HR+/Triple-negative
+groups are still thoroughly intermixed on PC1/PC2 -- the better-powered
+contrast doesn't reveal a global receptor-status structure the three-way
+split was missing. Combined with the per-compound regression above, receptor
+status looks like it has, at most, a small, compound-specific effect on this
+platform rather than a broad metabolic signature -- unlike the clear
+Control-vs-Cancer separation established earlier in this document.
+
+**Caveats.** (1) Three covariate terms were tested per compound (HR status,
+Age, BMI); each was BH-corrected across the 99 compounds independently for
+that term, not jointly across all ~297 tests, matching how each earlier
+single-factor analysis in this document was corrected. (2) The
+Triple-negative group is small (n = 24) relative to Receptor+ (n = 95), so
+the HR-status term has limited power to detect anything but a fairly large
+effect -- absence of significance here is not strong evidence of *no* effect,
+just of no *detectable* one at this sample size. (3) `Age (BOD-OD)` (age at
+blood draw) was used rather than `Age (now)`, which is not usable for this
+purpose (it is populated with a collection year, not an age, for Control
+rows, and is a different, less relevant reference point even for cancer
+rows).
+
+
