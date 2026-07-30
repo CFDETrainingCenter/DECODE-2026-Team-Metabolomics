@@ -112,12 +112,7 @@ All data preprocessing, statistical analysis, and visualization were performed u
 
 LC-MS abundances (99 compounds, 211 samples: 76 Control, 135 Cancer Stages 1–4) were log2-transformed, then each compound was tested for association with Stage via ANOVA (BH-corrected) with Tukey post-hoc and Welch cross-checks. Multivariate methods (clustering, PCA, sample correlation) and KEGG pathway enrichment followed.
 
-For prediction, we used **leakage-free PLS-DA** (train-only feature selection, CV-tuned, held-out test evaluation):
-
-- **1** Control-vs-Cancer model → **AUC 0.95**
-- **4** stage-specific Stage-vs-Control models → **AUC 0.87–1.00**
-
-Finally, per-compound linear regression tested receptor status, Age, and BMI as covariates.
+For prediction, we used **leakage-free PLS-DA** (train-only feature selection, CV-tuned, held-out test evaluation). Finally, per-compound linear regression tested receptor status, Age, and BMI as covariates.
 
 ### Dataset Description and Access
 
